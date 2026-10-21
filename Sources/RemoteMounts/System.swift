@@ -1,12 +1,20 @@
+import AppKit
 import Foundation
 
-/// Small wrappers around the OS: mount table, child commands, ~/.ssh/config, login item.
+/// Small wrappers around the OS: mount table, child commands, ssh, ~/.ssh/config, login item.
 enum System {
     static let home = FileManager.default.homeDirectoryForCurrentUser.path
 
     static var rclonePath: String? {
         ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"]
             .first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    static func rcloneVersion() -> String? {
+        guard let rclone = rclonePath else { return nil }
+        let (code, out) = run(rclone, ["version"], timeout: 10)
+        guard code == 0 else { return nil }
+        return out.split(separator: "\n").first.map { $0.replacingOccurrences(of: "rclone ", with: "") }
     }
 
     /// Paths currently mounted. MNT_NOWAIT so a dead NFS mount can't block us.
@@ -25,34 +33,84 @@ enum System {
     }
 
     /// Runs a command and returns (exit code, combined output); gives up after `timeout`.
+    /// Output goes through a temp file, not a pipe: a backgrounded ssh ControlMaster
+    /// inherits the pipe and would keep it open forever.
     @discardableResult
     static func run(_ path: String, _ args: [String], timeout: TimeInterval = 10) -> (Int32, String) {
+        let outURL = FileManager.default.temporaryDirectory.appendingPathComponent("rm-\(UUID().uuidString).out")
+        FileManager.default.createFile(atPath: outURL.path, contents: nil)
+        guard let handle = try? FileHandle(forWritingTo: outURL) else { return (-1, "can't create a temp file") }
+        defer {
+            try? handle.close()
+            try? FileManager.default.removeItem(at: outURL)
+        }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
         p.arguments = args
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = pipe
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = handle
+        p.standardError = handle
         do { try p.run() } catch { return (-1, error.localizedDescription) }
         let deadline = Date().addingTimeInterval(timeout)
         while p.isRunning && Date() < deadline { usleep(50_000) }
+        var code = p.terminationStatus
         if p.isRunning {
             p.terminate()
             usleep(300_000)
             if p.isRunning { kill(p.processIdentifier, SIGKILL) }
-            return (-2, "timed out")
+            code = -2
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return (p.terminationStatus, String(decoding: data, as: UTF8.self))
+        let text = (try? String(contentsOf: outURL, encoding: .utf8)) ?? ""
+        return (code, code == -2 ? text + "\ntimed out" : text)
     }
 
-    /// Kills any rclone left serving `mountPoint` (e.g. after a crash) and force-unmounts it.
-    static func forceCleanup(mountPoint: String) {
-        let escaped = mountPoint.map { "\\.^$*+?()[]{}|".contains($0) ? "\\\($0)" : String($0) }.joined()
-        run("/usr/bin/pkill", ["-f", "rclone nfsmount .* \(escaped)( |$)"], timeout: 5)
-        usleep(500_000)
+    /// Makes the kernel hand its buffered writes to every file system, including our NFS mounts.
+    static func flushWrites() {
+        run("/bin/sync", [], timeout: 10)
+    }
+
+    /// Asks the kernel to unmount while rclone is still serving, so its NFS client gets answers.
+    /// Killing rclone first leaves a mount whose server is gone, and unmounting that hangs in the kernel.
+    static func unmountServed(_ mountPoint: String) {
         guard mountedPaths().contains(mountPoint) else { return }
-        run("/sbin/umount", ["-f", mountPoint], timeout: 8)
+        run("/sbin/umount", [mountPoint], timeout: 8)
+        if mountedPaths().contains(mountPoint) { run("/sbin/umount", ["-f", mountPoint], timeout: 8) }
+        if mountedPaths().contains(mountPoint) {
+            run("/usr/sbin/diskutil", ["unmount", "force", mountPoint], timeout: 15)
+        }
+    }
+
+    /// Clears whatever a previous run left at `mountPoint`: a still-running rclone (stopped after
+    /// unmounting through it) or a mount whose rclone died. `lastPort` is the port that rclone served on.
+    static func forceCleanup(mountPoint: String, lastPort: Int?) {
+        let escaped = mountPoint.map { "\\.^$*+?()[]{}|".contains($0) ? "\\\($0)" : String($0) }.joined()
+        if hasOrphan(mountPoint: mountPoint) {
+            unmountServed(mountPoint)
+            run("/usr/bin/pkill", ["-f", "rclone nfsmount .* \(escaped)( |$)"], timeout: 5)
+            usleep(500_000)
+        }
+        guard mountedPaths().contains(mountPoint) else { return }
+        rescueStaleMount(mountPoint, port: lastPort)
+    }
+
+    /// The kernel keeps waiting for a dead NFS server, so stand in a throwaway one on the same
+    /// port; it answers every request with an error and the unmount can finish.
+    static func rescueStaleMount(_ mountPoint: String, port: Int?) {
+        var standIn: Process?
+        if let port, let rclone = rclonePath {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: rclone)
+            p.arguments = ["serve", "nfs", ":memory:", "--addr", "127.0.0.1:\(port)"]
+            p.standardInput = FileHandle.nullDevice
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            if (try? p.run()) != nil {
+                standIn = p
+                usleep(1_000_000)
+            }
+        }
+        defer { standIn?.terminate() }
+        run("/sbin/umount", ["-f", mountPoint], timeout: 10)
         if mountedPaths().contains(mountPoint) {
             run("/usr/sbin/diskutil", ["unmount", "force", mountPoint], timeout: 15)
         }
@@ -66,22 +124,114 @@ enum System {
         }
     }
 
-    /// Host aliases from ~/.ssh/config (and its Include files), skipping wildcard patterns.
-    static func sshHosts() -> [String] {
-        var seen = Set<String>()
-        var out: [String] = []
+    static func shellQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    // MARK: - ssh
+
+    /// ssh options for the app's own quick commands (test, folder browser). They share one
+    /// multiplexed connection so browsing doesn't pay a fresh login for every folder.
+    static func quickSSHArgs(_ host: String, _ command: String) -> [String] {
+        ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+         "-o", "ControlMaster=auto", "-o", "ControlPath=\(MountManager.cacheRoot)/cm-%C",
+         "-o", "ControlPersist=120", host, command]
+    }
+
+    struct RemoteListing {
+        var home: String
+        var path: String
+        var folders: [String]
+    }
+
+    /// Lists the folders in `path` on `host` (nil = home). Returns the listing or a friendly error.
+    static func listRemoteFolders(host: String, path: String?) -> (RemoteListing?, String?) {
+        let cdTarget = path.map { "cd -- \(shellQuote($0)) 2>/dev/null || exit 3; " } ?? ""
+        let cmd = "cd || exit 3; h=\"$PWD\"; \(cdTarget)echo __RM__; printf '%s\\n%s\\n' \"$h\" \"$PWD\"; ls -1Ap 2>/dev/null | sed -n 's|/$||p'"
+        let (code, out) = run("/usr/bin/ssh", quickSSHArgs(host, cmd), timeout: 25)
+        if code == 3 { return (nil, "That folder doesn't exist on the server") }
+        guard code == 0, let marker = out.range(of: "__RM__\n") else {
+            return (nil, friendlyError(out, host: host) ?? "ssh exited with \(code)")
+        }
+        let lines = out[marker.upperBound...].split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard lines.count >= 2 else { return (nil, "Unexpected reply from the server") }
+        let folders = lines.dropFirst(2).filter { !$0.isEmpty }
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        return (RemoteListing(home: lines[0], path: lines[1], folders: folders), nil)
+    }
+
+    /// Opens Terminal with an ssh session in the mount's remote folder.
+    static func openTerminal(host: String, remotePath: String) {
+        let cd = remotePath.isEmpty ? "" : "cd -- \(shellQuote(remotePath)) 2>/dev/null; "
+        let remoteCmd = "\(cd)exec \"$SHELL\" -l"
+        let script = "#!/bin/zsh\nclear\nexec ssh -t \(shellQuote(host)) \(shellQuote(remoteCmd))\n"
+        let safeHost = host.map { $0.isLetter || $0.isNumber || $0 == "-" ? String($0) : "_" }.joined()
+        let url = URL(fileURLWithPath: MountManager.cacheRoot + "/ssh-\(safeHost).command")
+        do {
+            try script.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+            NSWorkspace.shared.open(url)
+        } catch {
+            NSSound.beep()
+        }
+    }
+
+    /// Turns ssh/rclone error text into something a person can act on; nil if nothing matched.
+    static func friendlyError(_ raw: String, host: String) -> String? {
+        let s = raw.lowercased()
+        if s.contains("could not resolve hostname") || s.contains("nodename nor servname") {
+            return "Unknown host “\(host)” — check the name or your ~/.ssh/config"
+        }
+        if s.contains("host key verification failed") || s.contains("remote host identification has changed") {
+            return "The server's host key is new or changed — run “ssh \(host)” once in Terminal to accept it"
+        }
+        if s.contains("permission denied") || s.contains("too many authentication failures") {
+            return "The server refused your SSH key — check that “ssh \(host)” works without a password"
+        }
+        if s.contains("connection refused") { return "The server refused the connection — is SSH running?" }
+        if s.contains("timed out") || s.contains("no route to host") || s.contains("network is unreachable")
+            || s.contains("host is down") {
+            return "Can't reach the server — check your network or VPN"
+        }
+        if s.contains("resource busy") {
+            return "The mount folder is still busy from the last mount — retrying shortly"
+        }
+        if s.contains("subsystem request failed") { return "SFTP isn't enabled on this server" }
+        if s.contains("directory not found") || s.contains("no such file") { return "The remote folder doesn't exist" }
+        if s.contains("connection closed") || s.contains("broken pipe") || s.contains("exit status 255") {
+            return "The SSH connection dropped"
+        }
+        return nil
+    }
+
+    /// Host entries from ~/.ssh/config (and its Include files), skipping wildcard patterns.
+    static func sshHosts() -> [SSHHost] {
+        var hosts: [SSHHost] = []
+        var index: [String: Int] = [:]
         func parse(_ path: String, depth: Int) {
             guard depth < 4, let text = try? String(contentsOfFile: path, encoding: .utf8) else { return }
+            var current: [String] = []
             for raw in text.split(whereSeparator: \.isNewline) {
                 let parts = raw.trimmingCharacters(in: .whitespaces)
                     .split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "=" }).map(String.init)
-                guard parts.count > 1, let key = parts.first?.lowercased() else { continue }
-                if key == "host" {
-                    for h in parts.dropFirst()
-                    where !h.contains("*") && !h.contains("?") && !h.hasPrefix("!") && seen.insert(h).inserted {
-                        out.append(h)
+                guard parts.count > 1, let key = parts.first?.lowercased(), !key.hasPrefix("#") else { continue }
+                switch key {
+                case "host":
+                    current = parts.dropFirst().filter { !$0.contains("*") && !$0.contains("?") && !$0.hasPrefix("!") }
+                    for h in current where index[h] == nil {
+                        index[h] = hosts.count
+                        hosts.append(SSHHost(alias: h))
                     }
-                } else if key == "include" {
+                case "match":
+                    current = []
+                case "hostname", "user":
+                    for h in current {
+                        guard let i = index[h] else { continue }
+                        // ssh uses the first value it sees
+                        if key == "hostname", hosts[i].hostName == nil { hosts[i].hostName = parts[1] }
+                        if key == "user", hosts[i].user == nil { hosts[i].user = parts[1] }
+                    }
+                case "include":
                     for pat in parts.dropFirst() {
                         var full = (pat as NSString).expandingTildeInPath
                         if !full.hasPrefix("/") { full = home + "/.ssh/" + full }
@@ -93,11 +243,59 @@ enum System {
                             }
                         }
                     }
+                default:
+                    break
                 }
             }
         }
         parse(home + "/.ssh/config", depth: 0)
-        return out
+        return hosts
+    }
+}
+
+/// Minimal HTTP client for rclone's remote-control API on a unix socket.
+enum RCClient {
+    static func call(socketPath: String, _ method: String, timeout: Int = 3) -> [String: Any]? {
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var tv = timeval(tv_sec: timeout, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = Array(socketPath.utf8)
+        guard pathBytes.count < MemoryLayout.size(ofValue: addr.sun_path) else { return nil }
+        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+            raw.copyBytes(from: pathBytes)
+            raw[pathBytes.count] = 0
+        }
+        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        let connected = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connected == 0 else { return nil }
+
+        let body = "{}"
+        let request = "POST /\(method) HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+            + "Content-Length: \(body.utf8.count)\r\n\r\n\(body)"
+        let sent = request.withCString { send(fd, $0, strlen($0), 0) }
+        guard sent > 0 else { return nil }
+
+        var data = Data()
+        var buf = [UInt8](repeating: 0, count: 16_384)
+        while true {
+            let n = recv(fd, &buf, buf.count, 0)
+            if n <= 0 { break }
+            data.append(buf, count: n)
+            if data.count > 4_000_000 { break }
+        }
+        guard let split = data.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+        let json = data[split.upperBound...]
+        return (try? JSONSerialization.jsonObject(with: json)) as? [String: Any]
     }
 }
 

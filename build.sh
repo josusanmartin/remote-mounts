@@ -18,7 +18,11 @@ if [[ ${1:-} == install ]]; then
   # Quit politely so the running copy unmounts everything first
   if pgrep -xq RemoteMounts; then
     osascript -e 'tell application id "dev.josu.RemoteMounts" to quit' || true
-    for _ in {1..50}; do pgrep -xq RemoteMounts || break; sleep 0.2; done
+    for _ in {1..300}; do pgrep -xq RemoteMounts || break; sleep 0.2; done
+    if pgrep -xq RemoteMounts; then
+      echo "Remote Mounts is still running (waiting for uploads?); quit it and run again" >&2
+      exit 1
+    fi
   fi
   mkdir -p ~/Applications
   rm -rf ~/Applications/"Remote Mounts.app"
