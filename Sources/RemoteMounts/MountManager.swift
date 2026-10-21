@@ -62,6 +62,12 @@ final class MountManager: ObservableObject {
 
     func update(_ c: MountConfig) {
         guard let i = configs.firstIndex(where: { $0.id == c.id }), configs[i] != c else { return }
+        var c = c
+        let old = configs[i]
+        // The mount folder follows the name until the user picks one; a live mount stays where it is
+        if c.name != old.name, c.mountPoint == old.mountPoint, old.usesAutoMountPoint, activeConfigs[c.id] == nil {
+            c.mountPoint = MountConfig.autoMountPoint(for: c.name)
+        }
         configs[i] = c
     }
 

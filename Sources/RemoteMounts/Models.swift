@@ -7,7 +7,7 @@ struct MountConfig: Codable, Identifiable, Equatable {
     var host = ""
     /// Empty = the remote home folder, "/" = the whole filesystem, otherwise relative to home or absolute.
     var remotePath = ""
-    var mountPoint = "~/Mounts/new-server"
+    var mountPoint = MountConfig.autoMountPoint(for: "New Server")
     var autoMount = true
     var readOnly = false
     var cacheSizeGB = 10
@@ -30,6 +30,19 @@ struct MountConfig: Codable, Identifiable, Equatable {
         cacheSizeGB = try c.decodeIfPresent(Int.self, forKey: .cacheSizeGB) ?? d.cacheSizeGB
         dirCacheMinutes = try c.decodeIfPresent(Int.self, forKey: .dirCacheMinutes) ?? d.dirCacheMinutes
         extraFlags = try c.decodeIfPresent(String.self, forKey: .extraFlags) ?? d.extraFlags
+    }
+
+    /// Default mount folder for a name: ~/Mounts/<name>, with characters macOS paths can't hold replaced.
+    static func autoMountPoint(for name: String) -> String {
+        var folder = name.trimmingCharacters(in: .whitespaces)
+            .replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+        if folder.isEmpty || folder.hasPrefix(".") { folder = "untitled" + folder }
+        return "~/Mounts/" + folder
+    }
+
+    /// True while the mount folder is still the automatic one, so it should follow renames.
+    var usesAutoMountPoint: Bool {
+        mountPoint == Self.autoMountPoint(for: name) || mountPoint == "~/Mounts/new-server"
     }
 
     var expandedMountPoint: String {

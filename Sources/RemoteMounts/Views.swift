@@ -223,7 +223,7 @@ struct MountEditor: View {
             } header: {
                 Text("On this Mac")
             } footer: {
-                Text("Remote folder: leave empty for your home folder, or use / for the whole server.")
+                Text("Mount at follows the name until you choose another folder. Remote folder: leave empty for your home folder, or use / for the whole server.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -272,7 +272,6 @@ struct MountEditor: View {
         var v = c.wrappedValue
         v.host = h
         if v.name.isEmpty || v.name == "New Server" { v.name = h }
-        if v.mountPoint == MountConfig().mountPoint { v.mountPoint = "~/Mounts/\(h)" }
         c.wrappedValue = v
         testResult = nil
     }
