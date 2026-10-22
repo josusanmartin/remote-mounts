@@ -32,6 +32,14 @@ struct RemoteMountsApp: App {
             SettingsView().environmentObject(manager)
         }
 
+        Window("Unlock SSH Key", id: "unlock") {
+            UnlockKeyView().environmentObject(manager)
+        }
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+        .windowResizability(.contentSize)
+        .windowLevel(.floating)
+
         #if DEBUG
         // RM_MENU_PREVIEW=1 shows the menu bar panel in a normal window, for screenshots
         Window("Menu Preview", id: "menu-preview") {
@@ -60,6 +68,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        // So Terminal's ssh finds keys unlocked earlier with "Remember in my Keychain" after a restart, too
+        DispatchQueue.global(qos: .utility).async { SSHKeys.loadFromKeychain() }
         if MountManager.shared.configs.isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 MountManager.shared.showAddSheet = true
@@ -185,6 +195,9 @@ struct MenuBarLabel: View {
                     NSApp.activate(ignoringOtherApps: true)
                     openSettings()
                 }
+                manager.showUnlockWindow = { openWindow(id: "unlock") }
+                // A mount at launch may have asked before this view existed
+                if manager.unlockRequest != nil { manager.showUnlockWindow?() }
             }
     }
 

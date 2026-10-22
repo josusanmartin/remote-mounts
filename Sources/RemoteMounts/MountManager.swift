@@ -24,10 +24,24 @@ final class MountManager: ObservableObject {
     @Published var showAddSheet = false
     @Published var logSheetFor: UUID?
     @Published var loginItemEnabled = LoginItem.isEnabled { didSet { LoginItem.set(loginItemEnabled) } }
+    /// The locked SSH key whose passphrase the unlock window is asking for.
+    @Published private(set) var unlockRequest: UnlockRequest?
+    /// Mounts that couldn't start because their SSH key is locked.
+    @Published private(set) var lockedMounts: Set<UUID> = []
 
     /// Set by the menu bar label, the one view that can always reach SwiftUI's window actions.
     var showManagerWindow: (() -> Void)?
     var showSettingsWindow: (() -> Void)?
+    var showUnlockWindow: (() -> Void)?
+
+    struct UnlockRequest: Identifiable {
+        let id = UUID()
+        /// Hosts waiting on this key, for the prompt's wording.
+        var hosts: [String]
+        /// The host's candidate keys; unlocking any one of them is enough.
+        let keys: [String]
+        fileprivate var completions: [(Bool) -> Void]
+    }
 
     private var processes: [UUID: Process] = [:]
     private var preparing: Set<UUID> = []
@@ -42,6 +56,9 @@ final class MountManager: ObservableObject {
     /// Consecutive "nothing pending" readings for mounts waiting to unmount.
     private var idleChecks: [UUID: Int] = [:]
     private var timers: [Timer] = []
+    private var queuedUnlocks: [UnlockRequest] = []
+    /// Keys whose prompt was cancelled; background retries don't ask again until the user does something.
+    private var declinedKeys: Set<String> = []
     private let pathMonitor = NWPathMonitor()
     private var networkWasDown = false
 
@@ -165,7 +182,8 @@ final class MountManager: ObservableObject {
 
     // MARK: - Mount / unmount
 
-    func mount(_ id: UUID) {
+    /// `userInitiated: false` is for background retries, which don't re-ask for a passphrase the user dismissed.
+    func mount(_ id: UUID, userInitiated: Bool = true) {
         guard let c = config(id) else { return }
         retries[id]?.cancel()
         retries[id] = nil
@@ -195,22 +213,116 @@ final class MountManager: ObservableObject {
         guard processes[id] == nil, !preparing.contains(id) else { return }
         preparing.insert(id)
         statuses[id] = .mounting
+        lockedMounts.remove(id)
 
         let lastPort = lastNFSPort(id)
-        DispatchQueue.global(qos: .userInitiated).async {
-            try? FileManager.default.createDirectory(atPath: mp, withIntermediateDirectories: true)
-            // A previous run may have crashed and left the folder mounted or an rclone behind
-            if System.mountedPaths().contains(mp) || System.hasOrphan(mountPoint: mp) {
-                System.forceCleanup(mountPoint: mp, lastPort: lastPort)
-            }
-            Task { @MainActor in
-                self.preparing.remove(id)
-                guard self.wanted.contains(id), let current = self.config(id) else {
-                    if self.statuses[id] == .mounting { self.statuses[id] = .unmounted }
+        Task {
+            guard await ensureUnlocked(host: c.host, ask: userInitiated) else {
+                preparing.remove(id)
+                guard wanted.contains(id) else {
+                    if statuses[id] == .mounting { statuses[id] = .unmounted }
                     return
                 }
-                self.launch(current, rclone: rclone)
+                lockedMounts.insert(id)
+                statuses[id] = .failed("Your SSH key is locked — enter its passphrase to connect")
+                return
             }
+            DispatchQueue.global(qos: .userInitiated).async {
+                try? FileManager.default.createDirectory(atPath: mp, withIntermediateDirectories: true)
+                // A previous run may have crashed and left the folder mounted or an rclone behind
+                if System.mountedPaths().contains(mp) || System.hasOrphan(mountPoint: mp) {
+                    System.forceCleanup(mountPoint: mp, lastPort: lastPort)
+                }
+                Task { @MainActor in
+                    self.preparing.remove(id)
+                    guard self.wanted.contains(id), let current = self.config(id) else {
+                        if self.statuses[id] == .mounting { self.statuses[id] = .unmounted }
+                        return
+                    }
+                    self.launch(current, rclone: rclone)
+                }
+            }
+        }
+    }
+
+    // MARK: - Locked SSH keys
+
+    /// Makes sure `host` can log in without a prompt, asking for its key's passphrase if needed.
+    /// With `ask: false`, a key whose prompt the user cancelled stays locked without asking again.
+    /// Returns false if the key is still locked.
+    func ensureUnlocked(host: String, ask: Bool = true) async -> Bool {
+        let locked = await Task.detached { SSHKeys.lockedKeys(host: host) }.value
+        guard let key = locked.first else { return true }
+        if !ask && declinedKeys.contains(key) { return false }
+        return await withCheckedContinuation { cont in
+            requestUnlock(host: host, keys: locked) { cont.resume(returning: $0) }
+        }
+    }
+
+    func isWaitingForUnlock(_ id: UUID) -> Bool {
+        guard status(id) == .mounting, let host = config(id)?.host else { return false }
+        return unlockRequest?.hosts.contains(host) ?? false
+    }
+
+    /// Queues a prompt for `keys`; mounts that share a key share one prompt.
+    private func requestUnlock(host: String, keys: [String], done: @escaping (Bool) -> Void) {
+        func merge(_ r: inout UnlockRequest) -> Bool {
+            guard !Set(r.keys).isDisjoint(with: keys) else { return false }
+            if !r.hosts.contains(host) { r.hosts.append(host) }
+            r.completions.append(done)
+            return true
+        }
+        if var r = unlockRequest, merge(&r) {
+            unlockRequest = r
+            showUnlockWindow?()
+            return
+        }
+        for i in queuedUnlocks.indices {
+            if merge(&queuedUnlocks[i]) { return }
+        }
+        let r = UnlockRequest(hosts: [host], keys: keys, completions: [done])
+        if unlockRequest == nil {
+            unlockRequest = r
+            showUnlockWindow?()
+        } else {
+            queuedUnlocks.append(r)
+        }
+    }
+
+    /// Called by the unlock window.
+    func submitUnlock(key: String, passphrase: String, remember: Bool) async -> SSHKeys.UnlockResult {
+        let result = await Task.detached { SSHKeys.unlock(key, passphrase: passphrase, remember: remember) }.value
+        if result == .unlocked { finishUnlock(true) }
+        return result
+    }
+
+    func cancelUnlock() { finishUnlock(false) }
+
+    private func finishUnlock(_ ok: Bool) {
+        guard let r = unlockRequest else { return }
+        if ok { declinedKeys.subtract(r.keys) } else { declinedKeys.formUnion(r.keys) }
+        unlockRequest = nil
+        r.completions.forEach { $0(ok) }
+        presentNextUnlock()
+    }
+
+    private func presentNextUnlock() {
+        guard unlockRequest == nil, !queuedUnlocks.isEmpty else { return }
+        let next = queuedUnlocks.removeFirst()
+        Task {
+            // The key just unlocked may have been this host's too, under another file name
+            let locked = await Task.detached { SSHKeys.lockedKeys(host: next.hosts[0]) }.value
+            if locked.isEmpty {
+                next.completions.forEach { $0(true) }
+            } else if unlockRequest == nil {
+                unlockRequest = next
+                showUnlockWindow?()
+                return
+            } else {
+                queuedUnlocks.insert(next, at: 0)
+                return
+            }
+            presentNextUnlock()
         }
     }
 
@@ -307,6 +419,7 @@ final class MountManager: ObservableObject {
     /// Unmounts, first letting pending uploads finish unless `force` is set.
     func unmount(_ id: UUID, force: Bool = false) {
         openWhenMounted.remove(id)
+        lockedMounts.remove(id)
         retries[id]?.cancel()
         retries[id] = nil
         failures[id] = 0
@@ -382,7 +495,7 @@ final class MountManager: ObservableObject {
 
     /// Skips the backoff wait for every failed mount, e.g. after the network comes back.
     func retryFailedNow() {
-        for id in wanted where processes[id] == nil && !preparing.contains(id) { mount(id) }
+        for id in wanted where processes[id] == nil && !preparing.contains(id) { mount(id, userInitiated: false) }
     }
 
     private func networkChanged(up: Bool) {
@@ -424,7 +537,7 @@ final class MountManager: ObservableObject {
         let work = DispatchWorkItem { [weak self] in
             Task { @MainActor in
                 guard let self, self.wanted.contains(id) else { return }
-                self.mount(id)
+                self.mount(id, userInitiated: false)
             }
         }
         retries[id] = work
@@ -589,6 +702,7 @@ final class MountManager: ObservableObject {
     func testConnection(_ c: MountConfig) async -> (ok: Bool, message: String) {
         let host = c.host
         let path = c.rcloneRemotePath
+        guard await ensureUnlocked(host: host) else { return (false, "Your SSH key is locked") }
         return await Task.detached {
             let check = path.isEmpty ? "echo __ok" : "test -d \(System.shellQuote(path)) && echo __ok || echo __nofolder"
             let cmd = "\(check); command -v sftp-server >/dev/null 2>&1 || ls /usr/lib/openssh/sftp-server /usr/libexec/sftp-server /usr/lib/ssh/sftp-server >/dev/null 2>&1 || echo __nosftp"
@@ -603,3 +717,4 @@ final class MountManager: ObservableObject {
         }.value
     }
 }
+

@@ -102,6 +102,11 @@ struct RemoteFolderBrowser: View {
         selected = nil
         let host = host
         Task {
+            guard await MountManager.shared.ensureUnlocked(host: host) else {
+                loading = false
+                error = "Your SSH key is locked. Unlock it to browse the server."
+                return
+            }
             let (result, err) = await Task.detached { System.listRemoteFolders(host: host, path: path) }.value
             loading = false
             if let result { listing = result } else { error = err }

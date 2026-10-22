@@ -169,14 +169,15 @@ struct MenuMountRow: View {
                     .lineLimit(3)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 10) {
-                    if m.isWanted(id) { Button("Retry Now") { m.mount(id) } }
+                    if m.isWanted(id) { Button(m.lockedMounts.contains(id) ? "Unlock…" : "Retry Now") { m.mount(id) } }
                     Button("Show Log") { m.showLog(id) }
                 }
                 .buttonStyle(.link)
                 .font(.caption)
             }
         case .mounting:
-            Text("Connecting to \(config.host)…").font(.caption).foregroundStyle(.secondary)
+            Text(m.isWaitingForUnlock(id) ? "Waiting for your SSH key's passphrase…" : "Connecting to \(config.host)…")
+                .font(.caption).foregroundStyle(.secondary)
         case .unmounting, .finishingUploads:
             Text(status.label).font(.caption).foregroundStyle(.orange).lineLimit(2)
         case .mounted:

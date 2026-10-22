@@ -36,7 +36,8 @@ enum System {
     /// Output goes through a temp file, not a pipe: a backgrounded ssh ControlMaster
     /// inherits the pipe and would keep it open forever.
     @discardableResult
-    static func run(_ path: String, _ args: [String], timeout: TimeInterval = 10) -> (Int32, String) {
+    static func run(_ path: String, _ args: [String], timeout: TimeInterval = 10,
+                    environment: [String: String]? = nil) -> (Int32, String) {
         let outURL = FileManager.default.temporaryDirectory.appendingPathComponent("rm-\(UUID().uuidString).out")
         FileManager.default.createFile(atPath: outURL.path, contents: nil)
         guard let handle = try? FileHandle(forWritingTo: outURL) else { return (-1, "can't create a temp file") }
@@ -47,6 +48,7 @@ enum System {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
         p.arguments = args
+        if let environment { p.environment = ProcessInfo.processInfo.environment.merging(environment) { $1 } }
         p.standardInput = FileHandle.nullDevice
         p.standardOutput = handle
         p.standardError = handle
@@ -251,6 +253,112 @@ enum System {
         parse(home + "/.ssh/config", depth: 0)
         return hosts
     }
+}
+
+/// Passphrase-protected SSH keys. The app's ssh runs in batch mode and can't ask for a passphrase,
+/// so a locked key is unlocked once into the macOS ssh-agent, which every connection then shares:
+/// rclone's, the folder browser's and Terminal's.
+enum SSHKeys {
+    enum UnlockResult: Equatable {
+        case unlocked, wrongPassphrase
+        case failed(String)
+    }
+
+    /// Keys `host` needs unlocked before it can log in; empty when it can log in as is.
+    /// Reloads keys whose passphrases are in the Keychain before giving up.
+    static func lockedKeys(host: String) -> [String] {
+        var keys = keyState(host: host, loaded: agentFingerprints())
+        if !keys.locked.isEmpty {
+            loadFromKeychain()
+            keys = keyState(host: host, loaded: agentFingerprints())
+        }
+        guard !keys.locked.isEmpty else { return [] }
+        guard keys.anyUsable else { return keys.locked }
+        // Another of its keys works locally, but the server may only take the locked one, so ask it
+        let (code, out) = System.run("/usr/bin/ssh", System.quickSSHArgs(host, "true"), timeout: 20)
+        return code == 255 && out.lowercased().contains("permission denied") ? keys.locked : []
+    }
+
+    /// Locked keys when none of `host`'s keys is usable right now, without contacting the server.
+    static func lockedKeys(host: String, loaded: Set<String>) -> [String] {
+        let keys = keyState(host: host, loaded: loaded)
+        return keys.anyUsable ? [] : keys.locked
+    }
+
+    private static func keyState(host: String, loaded: Set<String>) -> (locked: [String], anyUsable: Bool) {
+        var locked: [String] = []
+        var anyUsable = false
+        for key in identityFiles(host: host) {
+            guard let fp = fingerprint(key) else { continue }
+            if loaded.contains(fp) || !needsPassphrase(key) { anyUsable = true } else { locked.append(key) }
+        }
+        return (locked, anyUsable)
+    }
+
+    /// The agent starts empty after a restart; this brings back every key whose passphrase
+    /// was saved in the Keychain, without asking.
+    static func loadFromKeychain() {
+        System.run("/usr/bin/ssh-add", ["--apple-load-keychain"], timeout: 10)
+    }
+
+    /// Key files ssh would offer for `host`, including its defaults when none are configured.
+    static func identityFiles(host: String) -> [String] {
+        let (code, out) = System.run("/usr/bin/ssh", ["-G", host], timeout: 5)
+        guard code == 0 else { return [] }
+        var seen = Set<String>()
+        return out.split(separator: "\n").compactMap { line in
+            guard line.hasPrefix("identityfile ") else { return nil }
+            let path = (String(line.dropFirst("identityfile ".count)) as NSString).expandingTildeInPath
+            guard FileManager.default.isReadableFile(atPath: path), seen.insert(path).inserted else { return nil }
+            return path
+        }
+    }
+
+    static func agentFingerprints() -> Set<String> {
+        let (_, out) = System.run("/usr/bin/ssh-add", ["-l"], timeout: 5)
+        return Set(out.split(separator: "\n").compactMap { line in
+            line.split(separator: " ").dropFirst().first.map(String.init).flatMap { $0.hasPrefix("SHA256:") ? $0 : nil }
+        })
+    }
+
+    static func fingerprint(_ key: String) -> String? {
+        let (code, out) = System.run("/usr/bin/ssh-keygen", ["-l", "-f", key], timeout: 5)
+        guard code == 0 else { return nil }
+        return out.split(separator: " ").dropFirst().first.map(String.init)
+    }
+
+    static func needsPassphrase(_ key: String) -> Bool {
+        let (code, out) = System.run("/usr/bin/ssh-keygen", ["-y", "-P", "", "-f", key], timeout: 5)
+        return code != 0 && out.contains("passphrase")
+    }
+
+    /// Adds `key` to the agent with `passphrase`; `remember` also saves the passphrase in the Keychain.
+    /// The passphrase reaches ssh-add through a one-shot askpass helper, never a file or the command line.
+    static func unlock(_ key: String, passphrase: String, remember: Bool) -> UnlockResult {
+        let helper = MountManager.cacheRoot + "/askpass"
+        let flag = MountManager.cacheRoot + "/askpass-" + UUID().uuidString
+        // ssh-add asks again after a wrong passphrase; answering only once makes it give up instead
+        let script = "#!/bin/sh\n[ -e \"$RM_ASKPASS_FLAG\" ] && exit 1\n: > \"$RM_ASKPASS_FLAG\"\n"
+            + "printf '%s\\n' \"$RM_ASKPASS_SECRET\"\n"
+        do {
+            try script.write(toFile: helper, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper)
+        } catch {
+            return .failed("Couldn't prepare the passphrase prompt: \(error.localizedDescription)")
+        }
+        defer { try? FileManager.default.removeItem(atPath: flag) }
+        let (code, out) = System.run("/usr/bin/ssh-add", (remember ? ["--apple-use-keychain"] : []) + [key],
+                                     timeout: 15, environment: [
+                                         "SSH_ASKPASS": helper, "SSH_ASKPASS_REQUIRE": "force",
+                                         "RM_ASKPASS_SECRET": passphrase, "RM_ASKPASS_FLAG": flag,
+                                     ])
+        if code == 0 { return .unlocked }
+        if code == -2 { return .failed("ssh-add didn't answer") }
+        if out.lowercased().contains("agent") { return .failed("Couldn't reach the Mac's SSH agent") }
+        return .wrongPassphrase
+    }
+
+    static func displayName(_ key: String) -> String { (key as NSString).abbreviatingWithTildeInPath }
 }
 
 /// Minimal HTTP client for rclone's remote-control API on a unix socket.

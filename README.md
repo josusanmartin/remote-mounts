@@ -3,6 +3,7 @@
 A macOS menu bar app that mounts SSH servers as local folders, so you can browse and edit them in Finder like local files.
 
 - **Add servers** from your `~/.ssh/config` (or `user@host`); logs in with your normal SSH keys and keychain.
+- **Passphrase-protected keys**: the first time a server needs a locked key, a prompt asks for the passphrase once, adds the key to the macOS ssh-agent and can save it in your Keychain; after a restart it's reloaded silently. The passphrase never touches disk or rclone's config.
 - **Menu bar panel**: a switch per server, click a row to mount and open it in Finder, hover for Finder / Terminal / more actions, Retry on failures.
 - **Safe unmount and quit**: pending uploads finish first (with a "Quit Now" escape); anything cut short resumes on the next mount.
 - **Live activity**: uploads in progress, transfer speed, local cache usage.

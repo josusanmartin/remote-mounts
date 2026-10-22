@@ -197,7 +197,8 @@ struct ServerDetail: View {
     private func headerStatus(_ status: MountStatus) -> String {
         switch status {
         case .mounted: return "Mounted at \(c.wrappedValue.displayMountPoint)"
-        case .mounting: return "Connecting to \(c.wrappedValue.host)…"
+        case .mounting:
+            return m.isWaitingForUnlock(id) ? "Waiting for your SSH key's passphrase…" : "Connecting to \(c.wrappedValue.host)…"
         case .unmounted: return "Not mounted"
         default: return status.label
         }
@@ -214,7 +215,7 @@ struct ServerDetail: View {
                 Button("Cancel") { m.unmount(id, force: true) }
             case .failed where m.isWanted(id):
                 Button("Stop") { m.unmount(id) }
-                Button("Retry Now") { m.mount(id) }.buttonStyle(.borderedProminent)
+                Button(m.lockedMounts.contains(id) ? "Unlock…" : "Retry Now") { m.mount(id) }.buttonStyle(.borderedProminent)
             case .mounted:
                 Button("Open in Finder") { m.openInFinder(id) }
                 Button("Unmount") { m.unmount(id) }
@@ -470,6 +471,8 @@ struct AddServerSheet: View {
     @State private var search = ""
     @State private var selected: String?
     @State private var custom = ""
+    /// Hosts whose SSH key needs a passphrase that isn't unlocked yet.
+    @State private var lockedHosts: Set<String> = []
 
     private var filtered: [SSHHost] {
         guard !search.isEmpty else { return hosts }
@@ -514,6 +517,12 @@ struct AddServerSheet: View {
                         if let d = h.detail { Text(d).font(.caption).foregroundStyle(.secondary) }
                     }
                     Spacer()
+                    if lockedHosts.contains(h.alias) {
+                        Image(systemName: "lock.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .help("Its SSH key has a passphrase; you'll be asked for it once")
+                    }
                     if added {
                         Text("Added").font(.caption).foregroundStyle(.secondary)
                     }
@@ -547,12 +556,25 @@ struct AddServerSheet: View {
         }
         .padding(20)
         .frame(width: 540, height: 560)
+        .task {
+            let aliases = hosts.map(\.alias)
+            lockedHosts = await Task.detached {
+                SSHKeys.loadFromKeychain()
+                let loaded = SSHKeys.agentFingerprints()
+                return Set(aliases.filter { !SSHKeys.lockedKeys(host: $0, loaded: loaded).isEmpty })
+            }.value
+        }
     }
 
     private func add(mount: Bool) {
         guard let host = chosenHost else { return }
         let id = m.addServer(host: host)
-        if mount { m.mount(id) }
+        if mount {
+            m.mount(id)
+        } else {
+            // Ask for a locked key's passphrase now, while the user is setting things up
+            Task { await m.ensureUnlocked(host: host) }
+        }
         dismiss()
     }
 }
