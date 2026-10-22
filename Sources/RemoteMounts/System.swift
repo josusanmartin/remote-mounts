@@ -75,7 +75,10 @@ enum System {
     /// Killing rclone first leaves a mount whose server is gone, and unmounting that hangs in the kernel.
     static func unmountServed(_ mountPoint: String) {
         guard mountedPaths().contains(mountPoint) else { return }
-        run("/sbin/umount", [mountPoint], timeout: 8)
+        // Through Disk Arbitration first: Finder only hears about unmounts made that way, and
+        // keeps a dead "contabo" volume in its sidebar after a plain umount
+        run("/usr/sbin/diskutil", ["unmount", mountPoint], timeout: 10)
+        if mountedPaths().contains(mountPoint) { run("/sbin/umount", [mountPoint], timeout: 8) }
         if mountedPaths().contains(mountPoint) { run("/sbin/umount", ["-f", mountPoint], timeout: 8) }
         if mountedPaths().contains(mountPoint) {
             run("/usr/sbin/diskutil", ["unmount", "force", mountPoint], timeout: 15)
