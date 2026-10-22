@@ -13,6 +13,8 @@ struct MountConfig: Codable, Identifiable, Equatable {
     var cacheSizeGB = 10
     var dirCacheMinutes = 10
     var extraFlags = ""
+    /// Watch the server for changes, so files made there show up right away.
+    var liveUpdates = true
 
     init() {}
 
@@ -30,6 +32,13 @@ struct MountConfig: Codable, Identifiable, Equatable {
         cacheSizeGB = try c.decodeIfPresent(Int.self, forKey: .cacheSizeGB) ?? d.cacheSizeGB
         dirCacheMinutes = try c.decodeIfPresent(Int.self, forKey: .dirCacheMinutes) ?? d.dirCacheMinutes
         extraFlags = try c.decodeIfPresent(String.self, forKey: .extraFlags) ?? d.extraFlags
+        liveUpdates = try c.decodeIfPresent(Bool.self, forKey: .liveUpdates) ?? d.liveUpdates
+    }
+
+    /// The folder the mount shows, as the server's shell would write it.
+    var remoteRoot: String {
+        let p = rcloneRemotePath
+        return p.isEmpty ? "~" : p.hasPrefix("/") ? p : "~/" + p
     }
 
     /// Default mount folder for a name: ~/Mounts/<name>, with characters macOS paths can't hold replaced.
@@ -106,6 +115,13 @@ enum MountStatus: Equatable {
         default: return false
         }
     }
+}
+
+/// Whether a mount is hearing about changes made on the server.
+enum LiveUpdateState: Equatable {
+    case starting
+    case watching(folders: Int)
+    case unavailable(String)
 }
 
 /// Live numbers from a running rclone's remote-control API.

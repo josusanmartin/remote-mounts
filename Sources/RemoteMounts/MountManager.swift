@@ -28,6 +28,7 @@ final class MountManager: ObservableObject {
     @Published private(set) var unlockRequest: UnlockRequest?
     /// Mounts that couldn't start because their SSH key is locked.
     @Published private(set) var lockedMounts: Set<UUID> = []
+    @Published private(set) var liveUpdates: [UUID: LiveUpdateState] = [:]
 
     /// Set by the menu bar label, the one view that can always reach SwiftUI's window actions.
     var showManagerWindow: (() -> Void)?
@@ -57,6 +58,9 @@ final class MountManager: ObservableObject {
     private var idleChecks: [UUID: Int] = [:]
     private var timers: [Timer] = []
     private var queuedUnlocks: [UnlockRequest] = []
+    /// One `ssh host python3 -` per mount, running rm-watch.py on the server.
+    private var watchers: [UUID: Process] = [:]
+    private var watcherRetries: [UUID: DispatchWorkItem] = [:]
     /// Keys whose prompt was cancelled; background retries don't ask again until the user does something.
     private var declinedKeys: Set<String> = []
     private let pathMonitor = NWPathMonitor()
@@ -112,6 +116,7 @@ final class MountManager: ObservableObject {
         // These don't affect the running process
         a.autoMount = false; b.autoMount = false
         a.name = ""; b.name = ""
+        a.liveUpdates = false; b.liveUpdates = false
         return a != b
     }
 
@@ -124,6 +129,14 @@ final class MountManager: ObservableObject {
             c.mountPoint = MountConfig.autoMountPoint(for: c.name)
         }
         configs[i] = c
+        if c.liveUpdates != old.liveUpdates, status(c.id).isUp {
+            if c.liveUpdates {
+                activeConfigs[c.id]?.liveUpdates = true
+                startWatcher(c.id)
+            } else {
+                stopWatcher(c.id)
+            }
+        }
     }
 
     /// Adds a server for `host` and selects it; returns its id.
@@ -150,6 +163,7 @@ final class MountManager: ObservableObject {
 
     func removeConfig(_ id: UUID) {
         unmount(id, force: true)
+        stopWatcher(id)
         configs.removeAll { $0.id == id }
         statuses[id] = nil
         stats[id] = nil
@@ -382,6 +396,9 @@ final class MountManager: ObservableObject {
             "--vfs-cache-max-size", "\(c.cacheSizeGB)G", "--vfs-fast-fingerprint",
             "--dir-cache-time", "\(max(1, c.dirCacheMinutes))m", "--attr-timeout", "10s",
             "--cache-dir", Self.cacheRoot + "/" + c.id.uuidString,
+            // The Mac's NFS client caches attributes for up to 60 s and remembers missing names;
+            // asking local rclone again is cheap, and lets server changes show up within seconds
+            "-o", "acregmin=1", "-o", "acregmax=3", "-o", "acdirmin=1", "-o", "acdirmax=3", "-o", "nonegnamecache",
             "--rc", "--rc-no-auth", "--rc-addr", "unix://" + socketPath(c.id),
             "--log-file", logPath(c.id), "--log-level", "NOTICE",
         ]
@@ -454,6 +471,7 @@ final class MountManager: ObservableObject {
     /// Unmounts through the running rclone, then stops it.
     private func stopProcess(_ id: UUID) {
         unmountWhenIdle.remove(id)
+        stopWatcher(id)
         let mp = activeConfigs[id]?.expandedMountPoint ?? config(id)?.expandedMountPoint
         guard let p = processes[id] else {
             if !preparing.contains(id) { statuses[id] = .unmounted }
@@ -505,6 +523,7 @@ final class MountManager: ObservableObject {
 
     private func processExited(_ id: UUID, _ proc: Process, code: Int32) {
         guard processes[id] === proc else { return }
+        stopWatcher(id)
         let mp = activeConfigs[id]?.expandedMountPoint
         let wasUp = status(id).isUp
         processes[id] = nil
@@ -556,6 +575,7 @@ final class MountManager: ObservableObject {
                     }
                     failures[id] = 0
                     if openWhenMounted.remove(id) != nil { openInFinder(id) }
+                    startWatcher(id)
                 }
             } else if statuses[id] == .mounting, let s = startedAt[id], Date().timeIntervalSince(s) > 60 {
                 // Kill it; the exit handler reports the error and schedules a retry
@@ -600,6 +620,8 @@ final class MountManager: ObservableObject {
         timers.forEach { $0.invalidate() }
         pathMonitor.cancel()
         retries.values.forEach { $0.cancel() }
+        watcherRetries.values.forEach { $0.cancel() }
+        watchers.values.forEach { $0.terminate() }
         wanted.removeAll()
         let running = processes.map { (id: $0.key, process: $0.value,
                                        mountPoint: activeConfigs[$0.key]?.expandedMountPoint,
@@ -620,6 +642,95 @@ final class MountManager: ObservableObject {
                 System.rescueStaleMount(mp, port: r.port)
             }
         }
+    }
+
+    // MARK: - Live updates
+
+    /// Starts rm-watch.py on the server; it reports folders that change there, and each one is
+    /// dropped from rclone's folder cache so Finder sees the change within a few seconds.
+    private func startWatcher(_ id: UUID) {
+        watcherRetries[id]?.cancel()
+        watcherRetries[id] = nil
+        guard watchers[id] == nil, let c = activeConfigs[id], c.liveUpdates,
+              let script = Bundle.main.path(forResource: "rm-watch", ofType: "py"),
+              let input = FileHandle(forReadingAtPath: script) else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        p.arguments = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15",
+                       "-o", "ServerAliveCountMax=3", c.host, "python3 - \(System.shellQuote(c.remoteRoot)) 20000"]
+        p.standardInput = input
+        let log = FileHandle(forWritingAtPath: logPath(id))
+        log?.seekToEndOfFile()
+        p.standardError = log ?? FileHandle.nullDevice
+        let out = Pipe()
+        p.standardOutput = out
+        let buffer = LineBuffer()
+        out.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let data = h.availableData
+            guard !data.isEmpty else { h.readabilityHandler = nil; return }
+            let lines = buffer.append(data)
+            if !lines.isEmpty { Task { @MainActor in self?.watcherSaid(id, p, lines) } }
+        }
+        p.terminationHandler = { [weak self] proc in
+            let code = proc.terminationStatus
+            Task { @MainActor in self?.watcherExited(id, proc, code: code) }
+        }
+        do { try p.run() } catch { return }
+        watchers[id] = p
+        liveUpdates[id] = .starting
+    }
+
+    private func stopWatcher(_ id: UUID) {
+        watcherRetries[id]?.cancel()
+        watcherRetries[id] = nil
+        liveUpdates[id] = nil
+        guard let p = watchers.removeValue(forKey: id) else { return }
+        p.terminate()
+    }
+
+    private func watcherSaid(_ id: UUID, _ p: Process, _ lines: [String]) {
+        guard watchers[id] === p else { return }
+        var dirs: [String] = []
+        for line in lines {
+            if line.hasPrefix("ready ") {
+                liveUpdates[id] = .watching(folders: Int(line.dropFirst(6)) ?? 0)
+            } else if line.hasPrefix("error ") {
+                liveUpdates[id] = .unavailable(String(line.dropFirst(6)))
+            } else {
+                dirs.append(line)
+            }
+        }
+        guard !dirs.isEmpty else { return }
+        let sock = socketPath(id)
+        DispatchQueue.global(qos: .utility).async {
+            if dirs.contains("*") {
+                RCClient.call(socketPath: sock, "vfs/forget")  // events were lost: re-read everything
+            } else {
+                for d in dirs { RCClient.call(socketPath: sock, "vfs/forget", params: ["dir": d]) }
+            }
+        }
+    }
+
+    private func watcherExited(_ id: UUID, _ p: Process, code: Int32) {
+        guard watchers[id] === p else { return }
+        watchers[id] = nil
+        guard status(id).isUp, activeConfigs[id]?.liveUpdates == true else {
+            liveUpdates[id] = nil
+            return
+        }
+        // 127: no python3 on the server; 2: not Linux (no inotify). Retrying won't help
+        if code == 127 || code == 2 || liveUpdates[id]?.isUnavailable == true {
+            if liveUpdates[id]?.isUnavailable != true {
+                liveUpdates[id] = .unavailable(code == 127 ? "the server has no python3" : "the server isn't Linux")
+            }
+            return
+        }
+        liveUpdates[id] = .starting
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in self?.startWatcher(id) }
+        }
+        watcherRetries[id] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: work)
     }
 
     // MARK: - Notifications
@@ -718,3 +829,24 @@ final class MountManager: ObservableObject {
     }
 }
 
+/// Splits a process's output into lines as it arrives.
+private final class LineBuffer: @unchecked Sendable {
+    private var data = Data()
+    private let lock = NSLock()
+
+    func append(_ chunk: Data) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        data.append(chunk)
+        var lines: [String] = []
+        while let nl = data.firstIndex(of: 0x0A) {
+            lines.append(String(decoding: data[data.startIndex..<nl], as: UTF8.self))
+            data.removeSubrange(data.startIndex...nl)
+        }
+        return lines
+    }
+}
+
+extension LiveUpdateState {
+    var isUnavailable: Bool { if case .unavailable = self { return true } else { return false } }
+}

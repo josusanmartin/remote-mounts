@@ -323,6 +323,27 @@ struct ServerDetail: View {
             }
 
             Section {
+                Toggle("Show changes made on the server right away", isOn: c.liveUpdates)
+                if cfg.liveUpdates, status.isUp {
+                    LabeledContent("Live updates") {
+                        switch m.liveUpdates[id] {
+                        case .watching(let n):
+                            Text("Watching \(n.formatted()) folders").foregroundStyle(.secondary)
+                        case .unavailable(let why):
+                            Text("Unavailable: \(why)").foregroundStyle(.orange)
+                        default:
+                            Text("Starting…").foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            } header: {
+                Text("Changes on the Server")
+            } footer: {
+                Text("Files and folders created on the server by you, scripts or other people appear here within a few seconds. A small helper runs on the server while it's mounted (it needs python3 on Linux). It watches up to 20,000 folders, nearest first, and skips hidden ones and folders like node_modules; elsewhere changes show up when the remembered folder contents expire.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section {
                 Stepper(value: c.cacheSizeGB, in: 1...500) {
                     LabeledContent("Keep opened files up to", value: "\(cfg.cacheSizeGB) GB")
                 }
@@ -332,7 +353,7 @@ struct ServerDetail: View {
             } header: {
                 Text("Speed")
             } footer: {
-                Text("Files you open are kept on this Mac, so opening them again is instant. Remembering folders longer makes browsing faster, but new files created on the server show up later.")
+                Text("Files you open are kept on this Mac, so opening them again is instant. Remembering folders longer makes browsing faster; without live updates, files created on the server show up only after that time.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 

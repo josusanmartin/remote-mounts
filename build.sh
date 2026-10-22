@@ -18,7 +18,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/"
 cp Info.plist "$APP/Contents/"
 [[ -f AppIcon.icns ]] && cp AppIcon.icns "$APP/Contents/Resources/"
-cp tools/rm-open "$APP/Contents/Resources/"
+cp tools/rm-open tools/rm-watch.py "$APP/Contents/Resources/"
 codesign --force --sign - "$APP"
 echo "built $APP"
 

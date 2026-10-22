@@ -37,6 +37,7 @@ It lives in the menu bar, with a full window for managing servers.
 | 🖱️ **One click** | A switch per server in the menu bar. Click a row to mount it and open it in Finder. |
 | 🔑 **Uses your SSH setup** | Hosts come straight from `~/.ssh/config`. Passphrase-protected keys get a one-time prompt and can be remembered in your Keychain. |
 | ⚡ **Fast on slow links** | Tuned for distant servers: files you open are cached locally, folder listings are remembered, and connections are kept warm. |
+| 👀 **Live updates** | Files and folders created on the server show up in Finder within seconds, not when a cache expires. |
 | 🛟 **Safe unmount and quit** | Pending uploads finish first, with a live count and a "Quit Now" escape. Anything cut short resumes on the next mount. |
 | 🔁 **Recovers on its own** | Reconnects with backoff, retries as soon as the network comes back or the Mac wakes, and cleans up after crashes. |
 | 📊 **See what's happening** | Live uploads, transfer speed and cache usage per server, plus notifications with plain-English errors. |
@@ -109,6 +110,15 @@ Remote Mounts was built against a server about 250 ms away, where the defaults m
 </details>
 
 <details>
+<summary><b>Live updates</b></summary>
+
+SFTP can't tell clients that something changed, so while a server is mounted the app runs a small helper on it: `tools/rm-watch.py`, sent over SSH to the server's own `python3` (nothing is installed, and it exits when the mount does). It uses Linux inotify to watch folders, nearest first, and reports each one that changes. The app then tells rclone to forget just those folders, and the Mac's NFS client re-checks folders every 1 to 3 seconds, so Finder picks up the change. It takes about 16 MB of memory on the server for 20,000 folders.
+
+Turn it off per server under **Changes on the Server**.
+
+</details>
+
+<details>
 <summary><b>Unmounting safely</b></summary>
 
 - Unmounting always goes through the running rclone first. If rclone is killed before the kernel lets go, the NFS mount is left pointing at a server that's gone, and unmounting it hangs. If that happens anyway (a crash), the app briefly stands in a throwaway `rclone serve nfs :memory:` on the old port so the unmount can finish.
@@ -139,7 +149,7 @@ Under the hood, the app links `~/.local/bin/rm-open` to the script inside the ap
 - Tested on a single Mac so far; other macOS versions and setups may hit bugs that haven't been seen yet.
 - Not notarized or signed with a Developer ID, so macOS warns on first launch.
 - Needs rclone installed separately.
-- Files and folders created on the server can take up to the "remember folder contents" time to show up in Finder.
+- Live updates need `python3` on a Linux server, and watch up to 20,000 folders (nearest first, skipping hidden ones and folders like `node_modules`). Changes elsewhere show up when the remembered folder contents expire (10 minutes by default).
 - Servers that only accept passwords (no SSH keys) aren't supported yet.
 - The iTerm2 option applies to profiles that exist when you turn it on.
 

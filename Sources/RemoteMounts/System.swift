@@ -366,7 +366,8 @@ enum SSHKeys {
 
 /// Minimal HTTP client for rclone's remote-control API on a unix socket.
 enum RCClient {
-    static func call(socketPath: String, _ method: String, timeout: Int = 3) -> [String: Any]? {
+    static func call(socketPath: String, _ method: String, params: [String: Any] = [:],
+                     timeout: Int = 3) -> [String: Any]? {
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
         defer { close(fd) }
@@ -390,7 +391,7 @@ enum RCClient {
         }
         guard connected == 0 else { return nil }
 
-        let body = "{}"
+        let body = (try? JSONSerialization.data(withJSONObject: params)).map { String(decoding: $0, as: UTF8.self) } ?? "{}"
         let request = "POST /\(method) HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\n"
             + "Content-Length: \(body.utf8.count)\r\n\r\n\(body)"
         let sent = request.withCString { send(fd, $0, strlen($0), 0) }
