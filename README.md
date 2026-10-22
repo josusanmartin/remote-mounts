@@ -34,3 +34,14 @@ Config lives in `~/Library/Application Support/RemoteMounts/mounts.json`, logs i
 Tuned for high-latency servers (~250 ms RTT): remote hashing is disabled (otherwise every file open runs `md5sum` over a new SSH login), SFTP connections are capped at 16 and kept open (sshd's default `MaxStartups 10` drops login bursts), and opened files are cached locally.
 
 Unmounting always goes through the running rclone first: killing rclone before the kernel unmounts leaves an NFS mount whose server is gone, and unmounting that hangs. If that happens anyway (a crash), the app stands in a throwaway `rclone serve nfs :memory:` on the old port so the unmount can finish.
+
+## ⌘-click server paths in iTerm2
+
+`tools/rm-open` opens a path printed on a server (`/home/josu/report/chart.png`, `~/x`, or a relative path) from the matching mounted folder (`~/contabo/report/chart.png`). URLs and local files open as before; `file:line` opens in VS Code at that line.
+
+Link it and point iTerm2's semantic history at it (Settings → Profiles → Advanced → Semantic History → **Always run command…**):
+
+```
+ln -s ~/dev/remote-mounts/tools/rm-open ~/.local/bin/rm-open
+~/.local/bin/rm-open \1 \5 \2
+```

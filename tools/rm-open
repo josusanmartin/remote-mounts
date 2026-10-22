@@ -1,0 +1,116 @@
+#!/usr/bin/python3
+"""Opens a path printed on a server, using the matching file in a Remote Mounts folder.
+
+  rm-open PATH [WORKING_DIR] [LINE]
+
+Meant for iTerm2's semantic history ("Always run command…"): ⌘-click on
+/home/josu/report/chart.png in an ssh session opens ~/contabo/report/chart.png.
+Local files and URLs open as usual, so it can replace the default ⌘-click.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+CONFIG = os.path.expanduser("~/Library/Application Support/RemoteMounts/mounts.json")
+# Home folders as they appear on Linux and macOS servers
+REMOTE_HOME = re.compile(r"^/(?:home/[^/]+|root|Users/[^/]+)(?:/(.*))?$")
+
+
+def clean(text):
+    """Strips what iTerm2 may include around a path: quotes, brackets, punctuation, :line:col."""
+    text = text.strip().strip("\"'`()[]<>{},;")
+    line = None
+    m = re.match(r"^(.*?):(\d+)(?::\d+)?:?$", text)
+    if m and not re.match(r"^[a-z][a-z0-9+.-]*://", text, re.I):
+        text, line = m.group(1), m.group(2)
+    return text.rstrip(".:"), line
+
+
+def mounted_servers():
+    """(remote folder, local mount folder) for every Remote Mounts server that is mounted now."""
+    try:
+        with open(CONFIG) as f:
+            configs = json.load(f)
+    except (OSError, ValueError):
+        return []
+    out = []
+    for c in configs:
+        mp = os.path.expanduser(c.get("mountPoint", ""))
+        if mp and os.path.ismount(mp):
+            out.append((c.get("remotePath", ""), mp))
+    return out
+
+
+def local_candidates(path, remote_root, mount_point):
+    """Where `path` (as printed on the server) would be inside this mount, if anywhere."""
+    if path.startswith("~/") or path == "~":
+        rest = path[2:]
+    else:
+        m = REMOTE_HOME.match(path)
+        rest = (m.group(1) or "") if m else None
+    root = remote_root.rstrip("/")
+    if remote_root.startswith("/") and root == "":  # the whole server
+        if path.startswith("/"):
+            yield mount_point + path
+    elif root in ("", "~"):  # mount shows the remote home folder
+        if rest is not None:
+            yield os.path.join(mount_point, rest)
+    elif root.startswith("~/"):  # a folder inside the remote home
+        sub = root[2:]
+        if rest is not None and (rest == sub or rest.startswith(sub + "/")):
+            yield os.path.join(mount_point, rest[len(sub):].lstrip("/"))
+    elif path == root or path.startswith(root + "/"):
+        yield mount_point + path[len(root):]
+
+
+def find(path, pwd):
+    if path.startswith("/") and os.path.exists(path):
+        return path
+    if not path.startswith(("/", "~")):
+        # Relative: the working directory iTerm2 knows (local, or remote with shell integration)
+        if not pwd:
+            return None
+        path = os.path.normpath(os.path.join(pwd, path))
+        if os.path.exists(path):
+            return path
+    for remote_root, mount_point in mounted_servers():
+        for cand in local_candidates(path, remote_root, mount_point):
+            if os.path.exists(cand):
+                return cand
+    return None
+
+
+def open_file(path, line):
+    if line and os.path.isfile(path):
+        for editor in ("/opt/homebrew/bin/code", "/usr/local/bin/code"):
+            if os.access(editor, os.X_OK):
+                subprocess.run([editor, "-g", f"{path}:{line}"])
+                return
+    subprocess.run(["/usr/bin/open", path])
+
+
+def main():
+    if len(sys.argv) < 2 or not sys.argv[1].strip():
+        return 1
+    text, line = clean(sys.argv[1])
+    pwd = sys.argv[2] if len(sys.argv) > 2 else ""
+    if len(sys.argv) > 3 and sys.argv[3].isdigit():
+        line = sys.argv[3]
+    if re.match(r"^[a-z][a-z0-9+.-]*://", text, re.I) or text.startswith("mailto:"):
+        subprocess.run(["/usr/bin/open", text])
+        return 0
+    found = find(text, pwd)
+    if found:
+        open_file(found, line)
+        return 0
+    if "/" in text:
+        msg = f"{text} isn't on this Mac or in a mounted server."
+        subprocess.run(["/usr/bin/osascript", "-e",
+                        f"display notification {json.dumps(msg)} with title \"Remote Mounts\""])
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
