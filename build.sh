@@ -1,19 +1,34 @@
 #!/bin/zsh
 # Builds Remote Mounts.app. `./build.sh install` also quits the running copy,
-# installs to ~/Applications and relaunches it.
+# installs to ~/Applications and relaunches it. `./build.sh release` builds for
+# Apple silicon and Intel and zips the app for a GitHub release.
 set -euo pipefail
 cd "${0:A:h}"
 
-swift build -c release
+if [[ ${1:-} == release ]]; then
+  swift build -c release --arch arm64 --arch x86_64
+  BIN=.build/apple/Products/Release/RemoteMounts
+else
+  swift build -c release
+  BIN=.build/release/RemoteMounts
+fi
 APP="build/Remote Mounts.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp .build/release/RemoteMounts "$APP/Contents/MacOS/"
+cp "$BIN" "$APP/Contents/MacOS/"
 cp Info.plist "$APP/Contents/"
 [[ -f AppIcon.icns ]] && cp AppIcon.icns "$APP/Contents/Resources/"
 cp tools/rm-open "$APP/Contents/Resources/"
 codesign --force --sign - "$APP"
 echo "built $APP"
+
+if [[ ${1:-} == release ]]; then
+  VERSION=$(plutil -extract CFBundleShortVersionString raw Info.plist)
+  ZIP="build/Remote-Mounts-$VERSION.zip"
+  rm -f "$ZIP"
+  ditto -c -k --keepParent "$APP" "$ZIP"
+  echo "zipped $ZIP"
+fi
 
 if [[ ${1:-} == install ]]; then
   # Quit politely so the running copy unmounts everything first
