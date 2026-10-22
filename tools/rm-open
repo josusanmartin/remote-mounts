@@ -6,7 +6,8 @@
 Meant for iTerm2's semantic history ("Always run command…"): ⌘-click on
 /home/josu/report/chart.png in an ssh session opens ~/contabo/report/chart.png.
 Local files and URLs open as usual, so it can replace the default ⌘-click.
-Files open after a confirmation dialog; pass --no-confirm first to skip it.
+Files open after a confirmation dialog, unless it's turned off in Remote Mounts'
+settings or --no-confirm is passed first.
 """
 import json
 import os
@@ -99,6 +100,13 @@ end run
 """
 
 
+def confirm_enabled():
+    """The "Ask before opening a file" setting in Remote Mounts (on unless turned off)."""
+    r = subprocess.run(["/usr/bin/defaults", "read", "dev.josu.RemoteMounts", "confirmOpen"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() != "0"
+
+
 def confirm(path):
     """Asks before opening; returns "Open", "Show in Finder" or "Cancel"."""
     shown = path.replace(os.path.expanduser("~"), "~", 1)
@@ -134,7 +142,7 @@ def main():
         return 0
     found = find(text, pwd)
     if found:
-        choice = confirm(found) if ask else "Open"
+        choice = confirm(found) if ask and confirm_enabled() else "Open"
         if choice == "Open":
             open_file(found, line)
         elif choice == "Show in Finder":

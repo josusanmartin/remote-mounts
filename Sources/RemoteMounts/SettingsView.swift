@@ -18,7 +18,10 @@ private struct GeneralSettings: View {
     @EnvironmentObject var m: MountManager
     @AppStorage("notifications") private var notifications = true
     @AppStorage("showInDock") private var showInDock = false
+    @AppStorage("confirmOpen") private var confirmOpen = true
     @State private var notificationsDenied = false
+    @State private var itermEnabled = ITermIntegration.isEnabled
+    @State private var itermPendingRestart = false
 
     var body: some View {
         Form {
@@ -48,6 +51,25 @@ private struct GeneralSettings: View {
                         }
                         .controlSize(.small)
                     }
+                }
+            }
+            if ITermIntegration.isInstalled {
+                Section {
+                    Toggle("Open server paths with ⌘-click", isOn: Binding(get: { itermEnabled }, set: { on in
+                        ITermIntegration.setEnabled(on)
+                        itermEnabled = ITermIntegration.isEnabled
+                        itermPendingRestart = ITermIntegration.isRunning
+                    }))
+                    Text("⌘-click /home/you/report/chart.png in an SSH session and it opens from the mounted folder. Links and files on this Mac open as usual.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if itermPendingRestart {
+                        Label("Quit and reopen iTerm2 to apply this.", systemImage: "arrow.clockwise")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                    Toggle("Ask before opening a file", isOn: $confirmOpen)
+                        .disabled(!itermEnabled)
+                } header: {
+                    Text("iTerm2")
                 }
             }
             Section {

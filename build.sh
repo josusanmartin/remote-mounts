@@ -11,6 +11,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp .build/release/RemoteMounts "$APP/Contents/MacOS/"
 cp Info.plist "$APP/Contents/"
 [[ -f AppIcon.icns ]] && cp AppIcon.icns "$APP/Contents/Resources/"
+cp tools/rm-open "$APP/Contents/Resources/"
 codesign --force --sign - "$APP"
 echo "built $APP"
 

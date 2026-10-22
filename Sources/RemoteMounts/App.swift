@@ -70,6 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
         // So Terminal's ssh finds keys unlocked earlier with "Remember in my Keychain" after a restart, too
         DispatchQueue.global(qos: .utility).async { SSHKeys.loadFromKeychain() }
+        if ITermIntegration.isEnabled { ITermIntegration.linkScript() }
         if MountManager.shared.configs.isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 MountManager.shared.showAddSheet = true

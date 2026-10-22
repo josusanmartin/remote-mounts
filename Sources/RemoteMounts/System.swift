@@ -407,6 +407,63 @@ enum RCClient {
     }
 }
 
+/// ⌘-click in iTerm2 runs the bundled rm-open script, which opens paths printed on a server
+/// from the matching mount. It's iTerm2's "Always run command…" semantic history setting.
+enum ITermIntegration {
+    static let bundleID = "com.googlecode.iterm2"
+    /// A path without spaces, since iTerm2 runs the command through the shell
+    static let linkPath = System.home + "/.local/bin/rm-open"
+    static let command = linkPath + " \\1 \\5 \\2"
+
+    static var isInstalled: Bool { NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) != nil }
+    static var isRunning: Bool { !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty }
+
+    static var isEnabled: Bool {
+        profiles().contains { semanticCommand($0) == command }
+    }
+
+    /// Turns the integration on or off for every iTerm2 profile. A running iTerm2 only reads its
+    /// profiles at launch, so the change applies after it restarts.
+    static func setEnabled(_ enabled: Bool) {
+        if enabled { linkScript() }
+        var profiles = profiles()
+        guard !profiles.isEmpty else { return }
+        for i in profiles.indices {
+            if enabled {
+                profiles[i]["Semantic History"] = ["action": "raw command", "text": command, "editor": ""]
+            } else if semanticCommand(profiles[i]) == command {
+                profiles[i]["Semantic History"] = nil  // back to iTerm2's default
+            }
+        }
+        CFPreferencesSetAppValue("New Bookmarks" as CFString, profiles as CFArray, bundleID as CFString)
+        CFPreferencesAppSynchronize(bundleID as CFString)
+    }
+
+    /// Points the link at the copy inside the app, so the script follows app updates.
+    /// Leaves a real file alone in case it's something else.
+    static func linkScript() {
+        guard let script = Bundle.main.path(forResource: "rm-open", ofType: nil) else { return }
+        let fm = FileManager.default
+        if let attrs = try? fm.attributesOfItem(atPath: linkPath), attrs[.type] as? FileAttributeType != .typeSymbolicLink {
+            return
+        }
+        if (try? fm.destinationOfSymbolicLink(atPath: linkPath)) == script { return }
+        try? fm.createDirectory(atPath: (linkPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try? fm.removeItem(atPath: linkPath)
+        try? fm.createSymbolicLink(atPath: linkPath, withDestinationPath: script)
+    }
+
+    private static func profiles() -> [[String: Any]] {
+        CFPreferencesAppSynchronize(bundleID as CFString)
+        return CFPreferencesCopyAppValue("New Bookmarks" as CFString, bundleID as CFString) as? [[String: Any]] ?? []
+    }
+
+    private static func semanticCommand(_ profile: [String: Any]) -> String? {
+        guard let sh = profile["Semantic History"] as? [String: Any], sh["action"] as? String == "raw command" else { return nil }
+        return sh["text"] as? String
+    }
+}
+
 /// "Open at login" via a per-user LaunchAgent that opens the app bundle.
 enum LoginItem {
     static let label = "dev.josu.RemoteMounts"
