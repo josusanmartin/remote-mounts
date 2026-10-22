@@ -37,7 +37,7 @@ Unmounting always goes through the running rclone first: killing rclone before t
 
 ## ⌘-click server paths in iTerm2
 
-`tools/rm-open` opens a path printed on a server (`/home/josu/report/chart.png`, `~/x`, or a relative path) from the matching mounted folder (`~/contabo/report/chart.png`). URLs and local files open as before; `file:line` opens in VS Code at that line.
+`tools/rm-open` opens a path printed on a server (`/home/josu/report/chart.png`, `~/x`, or a relative path) from the matching mounted folder (`~/contabo/report/chart.png`). It asks before opening a file (Open, Show in Finder, Cancel; `--no-confirm` skips the dialog). URLs open as before; `file:line` opens in VS Code at that line.
 
 Link it and point iTerm2's semantic history at it (Settings → Profiles → Advanced → Semantic History → **Always run command…**):
 

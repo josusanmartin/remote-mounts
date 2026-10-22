@@ -6,6 +6,7 @@
 Meant for iTerm2's semantic history ("Always run command…"): ⌘-click on
 /home/josu/report/chart.png in an ssh session opens ~/contabo/report/chart.png.
 Local files and URLs open as usual, so it can replace the default ⌘-click.
+Files open after a confirmation dialog; pass --no-confirm first to skip it.
 """
 import json
 import os
@@ -82,6 +83,31 @@ def find(path, pwd):
     return None
 
 
+# Arguments come in through argv so paths need no AppleScript escaping
+CONFIRM_SCRIPT = """
+on run argv
+    set {thePath, theName} to argv
+    try
+        set reply to display dialog "Open “" & theName & "”?" & return & return & thePath ¬
+            with title "Remote Mounts" buttons {"Cancel", "Show in Finder", "Open"} ¬
+            default button "Open" cancel button "Cancel" with icon note
+        return button returned of reply
+    on error number -128
+        return "Cancel"
+    end try
+end run
+"""
+
+
+def confirm(path):
+    """Asks before opening; returns "Open", "Show in Finder" or "Cancel"."""
+    shown = path.replace(os.path.expanduser("~"), "~", 1)
+    name = os.path.basename(path.rstrip("/")) or path
+    r = subprocess.run(["/usr/bin/osascript", "-e", CONFIRM_SCRIPT, shown, name],
+                       capture_output=True, text=True)
+    return r.stdout.strip() or "Cancel"
+
+
 def open_file(path, line):
     if line and os.path.isfile(path):
         for editor in ("/opt/homebrew/bin/code", "/usr/local/bin/code"):
@@ -92,18 +118,27 @@ def open_file(path, line):
 
 
 def main():
-    if len(sys.argv) < 2 or not sys.argv[1].strip():
+    args = sys.argv[1:]
+    ask = True
+    if args and args[0] == "--no-confirm":
+        ask = False
+        args = args[1:]
+    if not args or not args[0].strip():
         return 1
-    text, line = clean(sys.argv[1])
-    pwd = sys.argv[2] if len(sys.argv) > 2 else ""
-    if len(sys.argv) > 3 and sys.argv[3].isdigit():
-        line = sys.argv[3]
+    text, line = clean(args[0])
+    pwd = args[1] if len(args) > 1 else ""
+    if len(args) > 2 and args[2].isdigit():
+        line = args[2]
     if re.match(r"^[a-z][a-z0-9+.-]*://", text, re.I) or text.startswith("mailto:"):
         subprocess.run(["/usr/bin/open", text])
         return 0
     found = find(text, pwd)
     if found:
-        open_file(found, line)
+        choice = confirm(found) if ask else "Open"
+        if choice == "Open":
+            open_file(found, line)
+        elif choice == "Show in Finder":
+            subprocess.run(["/usr/bin/open", "-R", found])
         return 0
     if "/" in text:
         msg = f"{text} isn't on this Mac or in a mounted server."
