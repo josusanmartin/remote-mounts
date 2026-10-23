@@ -18,7 +18,7 @@ private struct GeneralSettings: View {
     @EnvironmentObject var m: MountManager
     @AppStorage("notifications") private var notifications = true
     @AppStorage("showInDock") private var showInDock = false
-    @AppStorage("confirmOpen") private var confirmOpen = true
+    @AppStorage("clickAction") private var clickAction = "ask"
     @State private var notificationsDenied = false
     @State private var itermEnabled = ITermIntegration.isEnabled
     @State private var itermPendingRestart = false
@@ -66,8 +66,14 @@ private struct GeneralSettings: View {
                         Label("Quit and reopen iTerm2 to apply this.", systemImage: "arrow.clockwise")
                             .font(.caption).foregroundStyle(.orange)
                     }
-                    Toggle("Ask before opening a file", isOn: $confirmOpen)
-                        .disabled(!itermEnabled)
+                    Picker("When you ⌘-click a server file", selection: $clickAction) {
+                        Text("Ask what to do").tag("ask")
+                        Text("Open it").tag("open")
+                        Text("Download it").tag("download")
+                    }
+                    .disabled(!itermEnabled)
+                    Text("Downloads are copied to your Downloads folder. Files on this Mac always open.")
+                        .font(.caption).foregroundStyle(.secondary)
                 } header: {
                     Text("iTerm2")
                 }

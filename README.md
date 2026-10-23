@@ -42,7 +42,7 @@ It lives in the menu bar, with a full window for managing servers.
 | 🔁 **Recovers on its own** | Reconnects with backoff, retries as soon as the network comes back or the Mac wakes, and cleans up after crashes. |
 | 📊 **See what's happening** | Live uploads, transfer speed and cache usage per server, plus notifications with plain-English errors. |
 | 🧭 **No typing paths** | Browse the server to pick the folder to mount; Test Connection checks everything before you mount. |
-| 💻 **Terminal friendly** | Open an SSH session in the mounted folder, and ⌘-click server paths in iTerm2 to open them from the mount. |
+| 💻 **Terminal friendly** | Open an SSH session in the mounted folder, and ⌘-click server paths in iTerm2 to open or download them. |
 
 ### Everything else
 
@@ -140,7 +140,7 @@ The passphrase goes straight to the system `ssh-add` and is never written to dis
 
 When a command on a server prints a path such as `/home/you/report/chart.png`, ⌘-click it in iTerm2 and it opens from the mounted folder on your Mac. Paths starting with `~/` and paths relative to the current folder work too, `file.py:42` opens in VS Code at that line, and links and local files open as usual.
 
-Turn it on in **Remote Mounts → Settings → iTerm2**. A dialog asks before opening each file (**Open**, **Show in Finder** or **Cancel**); you can switch that off in the same place.
+Turn it on in **Remote Mounts → Settings → iTerm2**. A dialog asks what to do with each file: **Open** it from the mount, **Download** a copy to your Downloads folder, **Show in Finder** or **Cancel**. In the same place you can skip the dialog and always open or always download.
 
 Under the hood, the app links `~/.local/bin/rm-open` to the script inside the app and sets iTerm2's semantic history (Profiles → Advanced → Semantic History → **Always run command…**) to `~/.local/bin/rm-open \1 \5 \2`. iTerm2 reads that setting at launch, so restart it after turning the option on or off.
 

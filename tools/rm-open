@@ -6,16 +6,21 @@
 Meant for iTerm2's semantic history ("Always run command…"): ⌘-click on
 /home/josu/report/chart.png in an ssh session opens ~/contabo/report/chart.png.
 Local files and URLs open as usual, so it can replace the default ⌘-click.
-Files open after a confirmation dialog, unless it's turned off in Remote Mounts'
-settings or --no-confirm is passed first.
+A dialog asks whether to open the file, download a copy to ~/Downloads or show it
+in Finder. Remote Mounts' settings can skip it and always open or always download;
+--no-confirm (passed first) always opens.
 """
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 CONFIG = os.path.expanduser("~/Library/Application Support/RemoteMounts/mounts.json")
+DOWNLOADS = os.path.expanduser("~/Downloads")
+APP_ID = "dev.josu.RemoteMounts"
 # Home folders as they appear on Linux and macOS servers
 REMOTE_HOME = re.compile(r"^/(?:home/[^/]+|root|Users/[^/]+)(?:/(.*))?$")
 
@@ -84,8 +89,27 @@ def find(path, pwd):
     return None
 
 
-# Arguments come in through argv so paths need no AppleScript escaping
+# An NSAlert rather than `display dialog`, which allows only three buttons.
+# Arguments come in through argv so paths need no escaping.
 CONFIRM_SCRIPT = """
+ObjC.import("AppKit");
+function run(argv) {
+    const [shown, name, buttons, appPath] = [argv[0], argv[1], argv[2].split("|"), argv[3]];
+    const app = $.NSApplication.sharedApplication;
+    app.setActivationPolicy(1 /* accessory */);
+    app.activateIgnoringOtherApps(true);
+    const alert = $.NSAlert.alloc.init;
+    alert.messageText = "Open \u201c" + name + "\u201d?";
+    alert.informativeText = shown;
+    if (appPath) alert.icon = $.NSWorkspace.sharedWorkspace.iconForFile(appPath);
+    buttons.forEach(b => alert.addButtonWithTitle(b));
+    alert.window.level = 8;  // modal panel level, above iTerm2
+    return buttons[alert.runModal - 1000] || "Cancel";
+}
+"""
+
+# The fallback if the alert can't be shown
+DIALOG_SCRIPT = """
 on run argv
     set {thePath, theName} to argv
     try
@@ -100,20 +124,82 @@ end run
 """
 
 
-def confirm_enabled():
-    """The "Ask before opening a file" setting in Remote Mounts (on unless turned off)."""
-    r = subprocess.run(["/usr/bin/defaults", "read", "dev.josu.RemoteMounts", "confirmOpen"],
+def click_action():
+    """What a ⌘-click on a server file does, from Remote Mounts' settings: ask, open or download."""
+    r = subprocess.run(["/usr/bin/defaults", "read", APP_ID, "clickAction"], capture_output=True, text=True)
+    action = r.stdout.strip()
+    return action if action in ("open", "download") else "ask"
+
+
+def app_path():
+    r = subprocess.run(["/usr/bin/mdfind", f"kMDItemCFBundleIdentifier == '{APP_ID}'"],
                        capture_output=True, text=True)
-    return r.stdout.strip() != "0"
+    paths = [p for p in r.stdout.splitlines() if p.endswith(".app")]
+    return paths[0] if paths else ""
 
 
-def confirm(path):
-    """Asks before opening; returns "Open", "Show in Finder" or "Cancel"."""
+def confirm(path, remote):
+    """Asks what to do; returns "Open", "Download", "Show in Finder" or "Cancel"."""
     shown = path.replace(os.path.expanduser("~"), "~", 1)
     name = os.path.basename(path.rstrip("/")) or path
-    r = subprocess.run(["/usr/bin/osascript", "-e", CONFIRM_SCRIPT, shown, name],
+    buttons = ["Open", "Download", "Show in Finder", "Cancel"] if remote else ["Open", "Show in Finder", "Cancel"]
+    # The app's own icon comes from the bundle this script lives in, when it's the bundled copy
+    bundle = os.path.realpath(__file__).rpartition(".app/")
+    icon = bundle[0] + ".app" if bundle[1] else app_path()
+    r = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e", CONFIRM_SCRIPT,
+                        shown, name, "|".join(buttons), icon], capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    r = subprocess.run(["/usr/bin/osascript", "-e", DIALOG_SCRIPT, shown, name],
                        capture_output=True, text=True)
     return r.stdout.strip() or "Cancel"
+
+
+def notify(msg):
+    subprocess.run(["/usr/bin/osascript", "-e",
+                    f"display notification {json.dumps(msg, ensure_ascii=False)} with title \"Remote Mounts\""])
+
+
+def unique_name(folder, name):
+    """"chart.png", then "chart 2.png", "chart 3.png"…, like Finder."""
+    stem, ext = os.path.splitext(name)
+    if name.startswith(".") and not ext:
+        stem, ext = name, ""
+    n = 1
+    while True:
+        cand = os.path.join(folder, name if n == 1 else f"{stem} {n}{ext}")
+        if not os.path.lexists(cand):
+            return cand
+        n += 1
+
+
+def download(path):
+    """Copies a file or folder from the mount into ~/Downloads and shows it in Finder."""
+    name = os.path.basename(path.rstrip("/"))
+    os.makedirs(DOWNLOADS, exist_ok=True)
+    big = os.path.isdir(path) or os.path.getsize(path) > 20_000_000
+    if big:
+        notify(f"Downloading {name}…")
+    # Copy into a hidden folder first, so a half-copied file never looks finished
+    tmp = tempfile.mkdtemp(prefix=".remote-mounts-", dir=DOWNLOADS)
+    try:
+        r = subprocess.run(["/usr/bin/ditto", path, os.path.join(tmp, name)],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            notify(f"Couldn't download {name}: {r.stderr.strip() or 'copy failed'}")
+            return 1
+        dest = unique_name(DOWNLOADS, name)
+        os.rename(os.path.join(tmp, name), dest)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if big:
+        notify(f"Downloaded {name} to Downloads")
+    subprocess.run(["/usr/bin/open", "-R", dest])
+    return 0
+
+
+def in_mount(path):
+    return any(path == mp or path.startswith(mp.rstrip("/") + "/") for _, mp in mounted_servers())
 
 
 def open_file(path, line):
@@ -142,16 +228,20 @@ def main():
         return 0
     found = find(text, pwd)
     if found:
-        choice = confirm(found) if ask and confirm_enabled() else "Open"
+        remote = in_mount(found)
+        action = click_action() if ask else "open"
+        if action == "download" and not remote:
+            action = "open"
+        choice = confirm(found, remote) if action == "ask" else action.capitalize()
         if choice == "Open":
             open_file(found, line)
+        elif choice == "Download":
+            return download(found)
         elif choice == "Show in Finder":
             subprocess.run(["/usr/bin/open", "-R", found])
         return 0
     if "/" in text:
-        msg = f"{text} isn't on this Mac or in a mounted server."
-        subprocess.run(["/usr/bin/osascript", "-e",
-                        f"display notification {json.dumps(msg)} with title \"Remote Mounts\""])
+        notify(f"{text} isn't on this Mac or in a mounted server.")
     return 1
 
 
