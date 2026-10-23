@@ -4,6 +4,7 @@ import SwiftUI
 /// The panel that drops down from the menu bar icon.
 struct MenuView: View {
     @EnvironmentObject var m: MountManager
+    @ObservedObject private var downloads = DownloadManager.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -20,6 +21,10 @@ struct MenuView: View {
                 }
                 .frame(maxHeight: 420)
                 .fixedSize(horizontal: false, vertical: true)
+            }
+            if !downloads.active.isEmpty {
+                Divider()
+                downloadsRow
             }
             Divider()
             footer
@@ -74,6 +79,33 @@ struct MenuView: View {
         .padding(24)
     }
 
+    /// Overall progress of downloads in flight; click for the Downloads window.
+    private var downloadsRow: some View {
+        let active = downloads.active
+        let total = active.reduce(Int64(0)) { $0 + $1.total }
+        let copied = active.reduce(Int64(0)) { $0 + $1.copied }
+        let speed = active.reduce(0) { $0 + $1.speed }
+        return Button { downloads.showWindow?() } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.system(size: 20)).foregroundStyle(.blue)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(active.count == 1 ? "Downloading \(active[0].name)" : "Downloading \(active.count) items")
+                        .font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.middle)
+                    if total > 0 {
+                        ProgressView(value: min(1, Double(copied) / Double(total))).controlSize(.small)
+                    }
+                    Text("\(Format.bytes(copied)) of \(Format.bytes(total))" + (speed > 0 ? " · " + Format.speed(speed) : ""))
+                        .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
     private var footer: some View {
         HStack(spacing: 14) {
             Button("Mount All") { m.mountAll() }.disabled(m.configs.isEmpty)
@@ -85,6 +117,7 @@ struct MenuView: View {
                     m.showAddSheet = true
                     m.showManagerWindow?()
                 }
+                Button("Downloads…") { downloads.showWindow?() }
                 Button("Settings…") { m.showSettingsWindow?() }
                 Divider()
                 Button("Quit Remote Mounts") { NSApp.terminate(nil) }

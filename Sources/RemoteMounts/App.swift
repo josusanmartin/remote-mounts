@@ -32,6 +32,15 @@ struct RemoteMountsApp: App {
             SettingsView().environmentObject(manager)
         }
 
+        Window("Downloads", id: "downloads") {
+            DownloadsView()
+        }
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+        .windowResizability(.contentSize)
+        .defaultPosition(.topTrailing)
+        .windowLevel(.floating)
+
         Window("Unlock SSH Key", id: "unlock") {
             UnlockKeyView().environmentObject(manager)
         }
@@ -71,12 +80,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // So Terminal's ssh finds keys unlocked earlier with "Remember in my Keychain" after a restart, too
         DispatchQueue.global(qos: .utility).async { SSHKeys.loadFromKeychain() }
         if ITermIntegration.isEnabled { ITermIntegration.linkScript() }
+        // remotemounts://download?path=… from rm-open. Installed here rather than through SwiftUI,
+        // which would open a window for the URL
+        NSAppleEventManager.shared().setEventHandler(self, andSelector: #selector(handleURL(_:reply:)),
+                                                     forEventClass: AEEventClass(kInternetEventClass),
+                                                     andEventID: AEEventID(kAEGetURL))
         if MountManager.shared.configs.isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 MountManager.shared.showAddSheet = true
                 MountManager.shared.showManagerWindow?()
             }
         }
+    }
+
+    @objc private func handleURL(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
+        guard let s = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
+              let url = URL(string: s) else { return }
+        DownloadManager.shared.handle(url)
     }
 
     // Opening the app again (Finder, Spotlight, `open`) shows the manager window
@@ -182,6 +202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
 struct MenuBarLabel: View {
     @ObservedObject var manager: MountManager
+    @ObservedObject private var downloads = DownloadManager.shared
     @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
 
@@ -197,6 +218,13 @@ struct MenuBarLabel: View {
                     openSettings()
                 }
                 manager.showUnlockWindow = { openWindow(id: "unlock") }
+                downloads.showWindow = {
+                    openWindow(id: "downloads")
+                    // On top of iTerm2, without taking the keyboard from it
+                    DispatchQueue.main.async {
+                        NSApp.windows.first { $0.title == "Downloads" }?.orderFrontRegardless()
+                    }
+                }
                 // A mount at launch may have asked before this view existed
                 if manager.unlockRequest != nil { manager.showUnlockWindow?() }
             }
@@ -204,6 +232,7 @@ struct MenuBarLabel: View {
 
     private var symbol: String {
         if manager.anyFailed { return "externaldrive.badge.exclamationmark" }
+        if !downloads.active.isEmpty { return "arrow.down.circle" }
         return manager.anyMounted ? "externaldrive.fill.badge.checkmark" : "externaldrive"
     }
 }

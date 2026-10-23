@@ -6,8 +6,8 @@
 Meant for iTerm2's semantic history ("Always run command…"): ⌘-click on
 /home/josu/report/chart.png in an ssh session opens ~/contabo/report/chart.png.
 Local files and URLs open as usual, so it can replace the default ⌘-click.
-A dialog asks whether to open the file, download a copy to ~/Downloads or show it
-in Finder. Remote Mounts' settings can skip it and always open or always download;
+A dialog asks whether to open the file, download a copy to ~/Downloads (the app
+shows the progress) or show it in Finder. Remote Mounts' settings can skip it and always open or always download;
 --no-confirm (passed first) always opens.
 """
 import json
@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 
 CONFIG = os.path.expanduser("~/Library/Application Support/RemoteMounts/mounts.json")
 DOWNLOADS = os.path.expanduser("~/Downloads")
@@ -143,11 +144,8 @@ def confirm(path, remote):
     shown = path.replace(os.path.expanduser("~"), "~", 1)
     name = os.path.basename(path.rstrip("/")) or path
     buttons = ["Open", "Download", "Show in Finder", "Cancel"] if remote else ["Open", "Show in Finder", "Cancel"]
-    # The app's own icon comes from the bundle this script lives in, when it's the bundled copy
-    bundle = os.path.realpath(__file__).rpartition(".app/")
-    icon = bundle[0] + ".app" if bundle[1] else app_path()
     r = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e", CONFIRM_SCRIPT,
-                        shown, name, "|".join(buttons), icon], capture_output=True, text=True)
+                        shown, name, "|".join(buttons), app_bundle()], capture_output=True, text=True)
     if r.returncode == 0 and r.stdout.strip():
         return r.stdout.strip()
     r = subprocess.run(["/usr/bin/osascript", "-e", DIALOG_SCRIPT, shown, name],
@@ -173,7 +171,23 @@ def unique_name(folder, name):
         n += 1
 
 
+def app_bundle():
+    """The Remote Mounts app this script belongs to, else wherever Spotlight finds it."""
+    bundle = os.path.realpath(__file__).rpartition(".app/")
+    return bundle[0] + ".app" if bundle[1] else app_path()
+
+
 def download(path):
+    """Hands the download to Remote Mounts, which shows its progress; copies it here if that fails."""
+    app = app_bundle()
+    if app:
+        url = "remotemounts://download?path=" + urllib.parse.quote(path, safe="")
+        if subprocess.run(["/usr/bin/open", "-g", "-a", app, url]).returncode == 0:
+            return 0
+    return copy_here(path)
+
+
+def copy_here(path):
     """Copies a file or folder from the mount into ~/Downloads and shows it in Finder."""
     name = os.path.basename(path.rstrip("/"))
     os.makedirs(DOWNLOADS, exist_ok=True)
