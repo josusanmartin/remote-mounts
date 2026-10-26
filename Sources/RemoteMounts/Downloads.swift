@@ -4,6 +4,8 @@ import UniformTypeIdentifiers
 
 /// Copies files and folders from a mounted server into ~/Downloads, with progress in the
 /// Downloads window. ⌘-click in iTerm2 (rm-open) hands paths over as remotemounts://download?path=…
+/// The copy goes through the mount's rclone straight from the server, never through the mount
+/// folder, so a stuck mount can't hang a download (or the app).
 @MainActor
 final class DownloadManager: ObservableObject {
     static let shared = DownloadManager()
@@ -23,14 +25,18 @@ final class DownloadManager: ObservableObject {
 
     func start(_ path: String) {
         let source = URL(fileURLWithPath: path).standardizedFileURL
-        // Any app or web page can open the URL, so only copy out of mounted servers
-        let mounts = MountManager.shared.configs.map(\.expandedMountPoint)
-        guard mounts.contains(where: { source.path.hasPrefix($0 + "/") }),
-              FileManager.default.fileExists(atPath: source.path) else {
+        // Any app or web page can open the URL, so only copy out of mounted servers. Matched by
+        // path alone: looking at the file itself would go through the mount.
+        let m = MountManager.shared
+        guard let c = m.configs.first(where: { source.path.hasPrefix($0.expandedMountPoint + "/") }),
+              m.status(c.id).isUp else {
             NSLog("Remote Mounts: not downloading \(path): not in a mounted server")
             return
         }
-        let d = Download(source: source)
+        let relative = String(source.path.dropFirst(c.expandedMountPoint.count + 1))
+        let root = c.rcloneRemotePath
+        let d = Download(source: source, job: CopyJob(socket: m.socketPath(c.id), root: ":sftp:" + root,
+                                                      path: relative))
         items.insert(d, at: 0)
         showWindow?()
         d.start()
@@ -49,7 +55,7 @@ final class DownloadManager: ObservableObject {
 @MainActor
 final class Download: ObservableObject, Identifiable {
     enum State: Equatable {
-        case counting(files: Int)
+        case starting
         case copying
         case done(URL)
         case failed(String)
@@ -59,27 +65,25 @@ final class Download: ObservableObject, Identifiable {
     nonisolated let id = UUID()
     let source: URL
     let name: String
-    let isFolder: Bool
-    @Published private(set) var state: State = .counting(files: 0)
+    @Published private(set) var isFolder = false
+    @Published private(set) var state: State = .starting
     @Published private(set) var copied: Int64 = 0
     @Published private(set) var total: Int64 = 0
     @Published private(set) var speed: Double = 0
 
-    private let job = CopyJob()
+    private let job: CopyJob
     private var timer: Timer?
     private var samples: [(time: Date, bytes: Int64)] = []
 
-    init(source: URL) {
+    init(source: URL, job: CopyJob) {
         self.source = source
+        self.job = job
         name = source.lastPathComponent
-        var isDir: ObjCBool = false
-        FileManager.default.fileExists(atPath: source.path, isDirectory: &isDir)
-        isFolder = isDir.boolValue
     }
 
     var isActive: Bool {
         switch state {
-        case .counting, .copying: return true
+        case .starting, .copying: return true
         default: return false
         }
     }
@@ -95,10 +99,10 @@ final class Download: ObservableObject, Identifiable {
     }
 
     func start() {
-        let (job, source) = (job, source)
+        let job = job
         let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
         Thread.detachNewThread {
-            let result = job.run(source: source, into: downloads)
+            let result = job.run(into: downloads)
             DispatchQueue.main.async { self.finish(result) }
         }
         let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
@@ -108,7 +112,10 @@ final class Download: ObservableObject, Identifiable {
         timer = t
     }
 
-    func cancel() { job.cancel() }
+    func cancel() {
+        let job = job
+        DispatchQueue.global().async { job.cancel() }
+    }
 
     private func refresh() {
         // The window's summary, the menu bar row and the menu bar icon add up all downloads
@@ -116,11 +123,8 @@ final class Download: ObservableObject, Identifiable {
         let p = job.progress
         copied = p.copied
         total = p.total
-        if p.copying {
-            if case .counting = state { state = .copying }
-        } else {
-            state = .counting(files: p.files)
-        }
+        if let folder = p.isFolder, folder != isFolder { isFolder = folder }
+        if p.copying, state == .starting { state = .copying }
         // Speed over the last few seconds, so it follows changes without jumping around
         let now = Date()
         samples.append((now, p.copied))
@@ -150,113 +154,133 @@ final class Download: ObservableObject, Identifiable {
     }
 }
 
-/// The copy itself, on a background thread. Copies into a temporary folder first, so a
-/// half-copied file never shows up in Downloads, then moves it in under a name that's free.
+/// The copy itself, run by the mount's rclone through its control socket and watched from a
+/// background thread. rclone copies into a temporary folder first, so a half-copied file never
+/// shows up in Downloads; then it's moved in under a name that's free.
 final class CopyJob: @unchecked Sendable {
     enum Failure: Error { case cancelled, error(String) }
-    struct Progress { var files = 0, copied: Int64 = 0, total: Int64 = 0, copying = false }
+    struct Progress { var copied: Int64 = 0, total: Int64 = 0, copying = false, isFolder: Bool? }
+
+    private let socket: String
+    private let root: String  // ":sftp:<the mount's remote folder>"
+    private let path: String  // inside that folder
+    private let group = "download-" + UUID().uuidString
 
     private let lock = NSLock()
     private var _progress = Progress()
     private var _cancelled = false
+    private var _jobs: [Int] = []
+
+    init(socket: String, root: String, path: String) {
+        self.socket = socket
+        self.root = root
+        self.path = path
+    }
 
     var progress: Progress { lock.withLock { _progress } }
-    func cancel() { lock.withLock { _cancelled = true } }
     private var cancelled: Bool { lock.withLock { _cancelled } }
     private func update(_ f: (inout Progress) -> Void) { lock.withLock { f(&_progress) } }
 
-    private struct Entry { let relative: String, kind: Kind, size: Int64 }
-    private enum Kind { case file, folder, link }
+    func cancel() {
+        let jobs = lock.withLock { _cancelled = true; return _jobs }
+        for id in jobs { rc("job/stop", ["jobid": id]) }
+    }
 
-    func run(source: URL, into downloads: URL) -> Result<URL, Failure> {
+    @discardableResult
+    private func rc(_ method: String, _ params: [String: Any], timeout: Int = 30) -> [String: Any]? {
+        RCClient.call(socketPath: socket, method, params: params, timeout: timeout)
+    }
+
+    /// Starts an rclone job in the background and returns its id.
+    private func startJob(_ method: String, _ params: [String: Any]) throws -> Int {
+        let r = rc(method, params.merging(["_async": true, "_group": group]) { $1 })
+        guard let id = r?["jobid"] as? Int else {
+            throw Failure.error((r?["error"] as? String).map(Self.friendly) ?? "Remote Mounts couldn't reach rclone")
+        }
+        lock.withLock { _jobs.append(id) }
+        return id
+    }
+
+    func run(into downloads: URL) -> Result<URL, Failure> {
         let fm = FileManager.default
         var staging: URL?
-        defer { if let staging { try? fm.removeItem(at: staging) } }
+        defer {
+            if let staging { try? fm.removeItem(at: staging) }
+            rc("core/stats-delete", ["group": group])
+        }
         do {
-            let entries = try list(source)
-            update {
-                $0.total = entries.reduce(0) { $0 + $1.size }
-                $0.copying = true
+            guard let item = rc("operations/stat", ["fs": root, "remote": path])?["item"] as? [String: Any] else {
+                throw Failure.error("It isn't on the server anymore")
             }
+            let isFolder = item["IsDir"] as? Bool ?? false
+            let name = (path as NSString).lastPathComponent
+            update {
+                $0.isFolder = isFolder
+                $0.total = isFolder ? 0 : (item["Size"] as? Int64 ?? Int64(item["Size"] as? Int ?? 0))
+            }
+            if cancelled { throw Failure.cancelled }
             try fm.createDirectory(at: downloads, withIntermediateDirectories: true)
             let tmp = try fm.url(for: .itemReplacementDirectory, in: .userDomainMask,
                                  appropriateFor: downloads, create: true)
             staging = tmp
-            let top = tmp.appendingPathComponent(source.lastPathComponent)
-            for e in entries {
-                if cancelled { return .failure(.cancelled) }
-                let from = e.relative.isEmpty ? source : source.appendingPathComponent(e.relative)
-                let to = e.relative.isEmpty ? top : top.appendingPathComponent(e.relative)
-                switch e.kind {
-                case .folder: try fm.createDirectory(at: to, withIntermediateDirectories: true)
-                case .link: try fm.createSymbolicLink(atPath: to.path, withDestinationPath: fm.destinationOfSymbolicLink(atPath: from.path))
-                case .file: try copyFile(from, to)
-                }
+            let top = tmp.appendingPathComponent(name)
+
+            let copy: Int
+            var sizing: Int?
+            if isFolder {
+                let folder = root.hasSuffix(":") ? root + path : root + "/" + path
+                copy = try startJob("sync/copy", ["srcFs": folder, "dstFs": top.path, "createEmptySrcDirs": true])
+                // The whole folder's size, for the progress bar; the copy's own total grows as it goes
+                sizing = try? startJob("operations/size", ["fs": folder])
+            } else {
+                copy = try startJob("operations/copyfile", ["srcFs": root, "srcRemote": path,
+                                                            "dstFs": tmp.path, "dstRemote": name])
             }
-            // Folders' dates last, since adding files to them changes their dates
-            for e in entries.reversed() where e.kind != .link {
-                let from = e.relative.isEmpty ? source : source.appendingPathComponent(e.relative)
-                let to = e.relative.isEmpty ? top : top.appendingPathComponent(e.relative)
-                if let attrs = try? fm.attributesOfItem(atPath: from.path) {
-                    try? fm.setAttributes(attrs.filter { $0.key == .modificationDate || $0.key == .posixPermissions },
-                                          ofItemAtPath: to.path)
+            update { $0.copying = true }
+
+            while true {
+                if cancelled { throw Failure.cancelled }
+                if let s = rc("core/stats", ["group": group], timeout: 5) {
+                    let bytes = Self.int64(s["bytes"]), seen = Self.int64(s["totalBytes"])
+                    update { $0.copied = bytes; $0.total = max($0.total, seen) }
                 }
+                if let id = sizing, let j = rc("job/status", ["jobid": id], timeout: 5), j["finished"] as? Bool == true {
+                    sizing = nil
+                    let size = Self.int64((j["output"] as? [String: Any])?["bytes"])
+                    update { $0.total = max($0.total, size) }
+                }
+                if let j = rc("job/status", ["jobid": copy], timeout: 5), j["finished"] as? Bool == true {
+                    if cancelled { throw Failure.cancelled }
+                    guard j["success"] as? Bool == true else {
+                        throw Failure.error(Self.friendly(j["error"] as? String ?? "The copy failed"))
+                    }
+                    break
+                }
+                usleep(300_000)
             }
-            let dest = freeName(in: downloads, for: source.lastPathComponent)
+            if let id = sizing { rc("job/stop", ["jobid": id]) }
+            guard fm.fileExists(atPath: top.path) else { throw Failure.error("rclone didn't copy anything") }
+            let dest = freeName(in: downloads, for: name)
             try fm.moveItem(at: top, to: dest)
             return .success(dest)
         } catch let f as Failure {
+            if case .cancelled = f { for id in lock.withLock({ _jobs }) { rc("job/stop", ["jobid": id]) } }
             return .failure(f)
         } catch {
             return .failure(.error(error.localizedDescription))
         }
     }
 
-    /// Everything to copy, parents before children. Folders are walked here, before copying,
-    /// so the progress bar knows the total size.
-    private func list(_ source: URL) throws -> [Entry] {
-        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey]
-        let v = try source.resourceValues(forKeys: Set(keys))
-        guard v.isDirectory == true else {
-            update { $0.files = 1 }
-            return [Entry(relative: "", kind: .file, size: Int64(v.fileSize ?? 0))]
-        }
-        var out = [Entry(relative: "", kind: .folder, size: 0)]
-        var error: Error?
-        let walker = FileManager.default.enumerator(at: source, includingPropertiesForKeys: keys,
-                                                    errorHandler: { _, e in error = e; return false })
-        let prefix = source.path.count + 1
-        while let url = walker?.nextObject() as? URL {
-            if cancelled { throw Failure.cancelled }
-            let v = try url.resourceValues(forKeys: Set(keys))
-            let rel = String(url.standardizedFileURL.path.dropFirst(prefix))
-            if v.isSymbolicLink == true {
-                out.append(Entry(relative: rel, kind: .link, size: 0))
-            } else if v.isDirectory == true {
-                out.append(Entry(relative: rel, kind: .folder, size: 0))
-            } else {
-                out.append(Entry(relative: rel, kind: .file, size: Int64(v.fileSize ?? 0)))
-                update { $0.files += 1 }
-            }
-        }
-        if let error { throw error }
-        return out
+    private static func int64(_ v: Any?) -> Int64 {
+        (v as? NSNumber)?.int64Value ?? 0
     }
 
-    private func copyFile(_ from: URL, _ to: URL) throws {
-        let input = try FileHandle(forReadingFrom: from)
-        defer { try? input.close() }
-        guard FileManager.default.createFile(atPath: to.path, contents: nil) else {
-            throw Failure.error("Couldn't create \(to.lastPathComponent) in Downloads")
-        }
-        let output = try FileHandle(forWritingTo: to)
-        defer { try? output.close() }
-        while true {
-            if cancelled { throw Failure.cancelled }
-            guard let chunk = try input.read(upToCount: 1 << 20), !chunk.isEmpty else { break }
-            try output.write(contentsOf: chunk)
-            update { $0.copied += Int64(chunk.count) }
-        }
+    private static func friendly(_ error: String) -> String {
+        let s = error.lowercased()
+        if s.contains("not found") || s.contains("no such file") { return "It isn't on the server anymore" }
+        if s.contains("permission denied") { return "The server won't let you read it" }
+        if s.contains("no space") { return "Your Mac is out of disk space" }
+        return error.count > 160 ? String(error.prefix(160)) + "…" : error
     }
 
     /// "chart.png", then "chart 2.png", "chart 3.png"…, like Finder.
@@ -364,7 +388,7 @@ struct DownloadRow: View {
     @ViewBuilder
     private var button: some View {
         switch d.state {
-        case .counting, .copying:
+        case .starting, .copying:
             HoverIconButton(systemImage: "xmark", help: "Stop downloading") { d.cancel() }
         case .done(let url):
             HoverIconButton(systemImage: "magnifyingglass", help: "Show in Finder") {
@@ -384,9 +408,13 @@ struct DownloadRow: View {
 
     private var detail: String {
         switch d.state {
-        case .counting(let files):
-            return files == 0 ? "Starting…" : "Looking through the folder… \(files) files"
+        case .starting:
+            return "Starting…"
         case .copying:
+            // A folder's total arrives once rclone has gone through it
+            if d.total == 0 {
+                return d.copied == 0 ? "Looking through the folder…" : "\(Format.bytes(d.copied)) so far"
+            }
             var parts = ["\(Format.bytes(d.copied)) of \(Format.bytes(d.total))"]
             if d.speed > 0 { parts.append(Format.speed(d.speed)) }
             if let s = d.secondsLeft { parts.append(Self.timeLeft(s)) }

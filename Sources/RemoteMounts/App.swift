@@ -80,6 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // So Terminal's ssh finds keys unlocked earlier with "Remember in my Keychain" after a restart, too
         DispatchQueue.global(qos: .utility).async { SSHKeys.loadFromKeychain() }
         if ITermIntegration.isEnabled { ITermIntegration.linkScript() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { MountManager.shared.reportForcedUnmountsFromLastQuit() }
         // remotemounts://download?path=… from rm-open. Installed here rather than through SwiftUI,
         // which would open a window for the URL
         NSAppleEventManager.shared().setEventHandler(self, andSelector: #selector(handleURL(_:reply:)),

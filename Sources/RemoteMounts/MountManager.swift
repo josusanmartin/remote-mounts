@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Synchronization
 import Network
 import UserNotifications
 
@@ -28,6 +29,10 @@ final class MountManager: ObservableObject {
     @Published private(set) var unlockRequest: UnlockRequest?
     /// Mounts that couldn't start because their SSH key is locked.
     @Published private(set) var lockedMounts: Set<UUID> = []
+    /// Mounts whose folder macOS still holds from an earlier mount ("Resource busy"). Retrying every
+    /// minute can't help and leaves Finder with a stale copy of the volume each time, so they wait
+    /// for the user.
+    private var heldMounts: Set<UUID> = []
     @Published private(set) var liveUpdates: [UUID: LiveUpdateState] = [:]
 
     /// Set by the menu bar label, the one view that can always reach SwiftUI's window actions.
@@ -228,6 +233,7 @@ final class MountManager: ObservableObject {
         preparing.insert(id)
         statuses[id] = .mounting
         lockedMounts.remove(id)
+        heldMounts.remove(id)
 
         let lastPort = lastNFSPort(id)
         Task {
@@ -399,6 +405,9 @@ final class MountManager: ObservableObject {
             // The Mac's NFS client caches attributes for up to 60 s and remembers missing names;
             // asking local rclone again is cheap, and lets server changes show up within seconds
             "-o", "acregmin=1", "-o", "acregmax=3", "-o", "acdirmin=1", "-o", "acdirmax=3", "-o", "nonegnamecache",
+            // rclone's NFS server has no lock manager. Without this, file locks go to the Mac's own
+            // rpc.lockd, which was starting up when a mount froze and couldn't be unmounted again
+            "-o", "locallocks",
             "--rc", "--rc-no-auth", "--rc-addr", "unix://" + socketPath(c.id),
             "--log-file", logPath(c.id), "--log-level", "NOTICE",
         ]
@@ -481,7 +490,9 @@ final class MountManager: ObservableObject {
         let lastPort = lastNFSPort(id)
         DispatchQueue.global(qos: .userInitiated).async {
             // Unmount while rclone still answers, then stop it
-            if let mp { System.unmountServed(mp) }
+            if let mp, let holders = System.unmountServed(mp) {
+                DispatchQueue.main.async { self.reportForcedUnmount(id, holders: holders) }
+            }
             p.terminate()
             for _ in 0..<50 where p.isRunning { usleep(100_000) }
             if p.isRunning { kill(p.processIdentifier, SIGKILL) }
@@ -513,7 +524,9 @@ final class MountManager: ObservableObject {
 
     /// Skips the backoff wait for every failed mount, e.g. after the network comes back.
     func retryFailedNow() {
-        for id in wanted where processes[id] == nil && !preparing.contains(id) { mount(id, userInitiated: false) }
+        for id in wanted where processes[id] == nil && !preparing.contains(id) && !heldMounts.contains(id) {
+            mount(id, userInitiated: false)
+        }
     }
 
     private func networkChanged(up: Bool) {
@@ -548,6 +561,17 @@ final class MountManager: ObservableObject {
         failures[id] = n
         let delay = [5, 10, 30, 60][min(n - 1, 3)]
         let reason = lastError(id) ?? "rclone stopped unexpectedly (code \(code))"
+        // The first "busy" can be the last unmount finishing; a second means macOS is stuck holding it
+        if n >= 2, lastRunLog(id).lowercased().contains("resource busy") {
+            heldMounts.insert(id)
+            let folder = config(id)?.displayMountPoint ?? mp ?? "The mount folder"
+            statuses[id] = .failed("macOS is still holding \(folder) from the last mount and won't let go. "
+                                   + "Restart your Mac to release it, then mount again.")
+            if let name = config(id)?.displayName {
+                notify("Couldn't mount \(name)", "macOS is still holding \(folder) from the last mount. Restart your Mac to release it.")
+            }
+            return
+        }
         statuses[id] = .failed(reason)
         if n == 1, let name = config(id)?.displayName {
             notify(wasUp ? "\(name) disconnected" : "Couldn't mount \(name)",
@@ -625,15 +649,23 @@ final class MountManager: ObservableObject {
         wanted.removeAll()
         let running = processes.map { (id: $0.key, process: $0.value,
                                        mountPoint: activeConfigs[$0.key]?.expandedMountPoint,
+                                       name: activeConfigs[$0.key]?.displayName,
                                        port: lastNFSPort($0.key)) }
+        let forced = Mutex<[String: [String]]>([:])
         let group = DispatchGroup()
         for r in running {
             DispatchQueue.global(qos: .userInitiated).async(group: group) {
-                if let mp = r.mountPoint { System.unmountServed(mp) }
+                if let mp = r.mountPoint, let holders = System.unmountServed(mp),
+                   let name = r.name {
+                    // Reported at the next launch, since notifications can't outlive the app
+                    forced.withLock { $0[name] = holders }
+                }
                 r.process.terminate()
             }
         }
         _ = group.wait(timeout: .now() + 20)
+        let forcedNames = forced.withLock { $0 }
+        if !forcedNames.isEmpty { UserDefaults.standard.set(forcedNames, forKey: "forcedUnmounts") }
         let deadline = Date().addingTimeInterval(3)
         while running.contains(where: { $0.process.isRunning }) && Date() < deadline { usleep(100_000) }
         for r in running {
@@ -735,6 +767,27 @@ final class MountManager: ObservableObject {
 
     // MARK: - Notifications
 
+    /// Forcing an unmount can leave Finder showing stale copies of the volume, which only a Finder
+    /// relaunch clears, so say what happened and what held it.
+    func reportForcedUnmount(_ id: UUID, holders: [String]) {
+        guard let name = config(id)?.displayName else { return }
+        reportForcedUnmount(name: name, holders: holders)
+    }
+
+    private func reportForcedUnmount(name: String, holders: [String]) {
+        let who = holders.isEmpty ? "Another app" : ListFormatter.localizedString(byJoining: holders)
+        notify("\(name) had to be unmounted by force",
+               "\(who) still had files open in it. If Finder now shows extra copies of \(name), "
+               + "choose Relaunch Finder from the Remote Mounts menu.")
+    }
+
+    /// Forced unmounts while quitting, reported once the app is back.
+    func reportForcedUnmountsFromLastQuit() {
+        guard let forced = UserDefaults.standard.dictionary(forKey: "forcedUnmounts") as? [String: [String]] else { return }
+        UserDefaults.standard.removeObject(forKey: "forcedUnmounts")
+        for (name, holders) in forced { reportForcedUnmount(name: name, holders: holders) }
+    }
+
     private func notify(_ title: String, _ body: String) {
         guard notificationsEnabled else { return }
         let content = UNMutableNotificationContent()
@@ -749,11 +802,14 @@ final class MountManager: ObservableObject {
     func logPath(_ id: UUID) -> String { Self.logDir + "/\(id.uuidString).log" }
 
     /// Last ERROR/CRITICAL line from the mount's log, made readable.
-    private func lastError(_ id: UUID) -> String? {
+    /// The log of the latest rclone run.
+    private func lastRunLog(_ id: UUID) -> String {
         let tail = readLogTail(id, maxBytes: 6000)
-        // Only look at the latest run
-        let run = tail.components(separatedBy: "\n=== ").last ?? tail
-        let lines = run.split(separator: "\n").map(String.init)
+        return tail.components(separatedBy: "\n=== ").last ?? tail
+    }
+
+    private func lastError(_ id: UUID) -> String? {
+        let lines = lastRunLog(id).split(separator: "\n").map(String.init)
         if let host = config(id)?.host, let friendly = System.friendlyError(lines.suffix(15).joined(separator: "\n"), host: host) {
             return friendly
         }

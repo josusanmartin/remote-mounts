@@ -124,6 +124,9 @@ Turn it off per server under **Changes on the Server**.
 - Unmounting always goes through the running rclone first. If rclone is killed before the kernel lets go, the NFS mount is left pointing at a server that's gone, and unmounting it hangs. If that happens anyway (a crash), the app briefly stands in a throwaway `rclone serve nfs :memory:` on the old port so the unmount can finish.
 - Unmounts go through Disk Arbitration first, so Finder drops the volume instead of keeping a dead entry in its sidebar.
 - Before unmounting or quitting, the app flushes the Mac's buffered writes and asks rclone directly whether anything is still uploading.
+- If another app keeps files open in the mount (a virtual machine sharing your home folder, say), the unmount has to be forced. Finder can then list stale copies of the volume; the app tells you which app held it, and **Relaunch Finder** in its menu clears them.
+- If macOS keeps holding the mount folder after an unmount ("Resource busy"), the app stops retrying and asks you to restart the Mac, instead of trying again every minute.
+- Mounts use `locallocks`: rclone's NFS server has no lock manager, so file locks stay on the Mac instead of going through `rpc.lockd`.
 
 </details>
 
@@ -140,7 +143,7 @@ The passphrase goes straight to the system `ssh-add` and is never written to dis
 
 When a command on a server prints a path such as `/home/you/report/chart.png`, ⌘-click it in iTerm2 and it opens from the mounted folder on your Mac. Paths starting with `~/` and paths relative to the current folder work too, `file.py:42` opens in VS Code at that line, and links and local files open as usual.
 
-Turn it on in **Remote Mounts → Settings → iTerm2**. A dialog asks what to do with each file: **Open** it from the mount, **Download** a copy to your Downloads folder (a Downloads window shows progress, speed and time left, with a stop button), **Show in Finder** or **Cancel**. In the same place you can skip the dialog and always open or always download.
+Turn it on in **Remote Mounts → Settings → iTerm2**. A dialog asks what to do with each file: **Open** it from the mount, **Download** a copy to your Downloads folder (a Downloads window shows progress, speed and time left, with a stop button; the copy comes straight from the server through rclone, not through the mounted folder), **Show in Finder** or **Cancel**. In the same place you can skip the dialog and always open or always download.
 
 Under the hood, the app links `~/.local/bin/rm-open` to the script inside the app and sets iTerm2's semantic history (Profiles → Advanced → Semantic History → **Always run command…**) to `~/.local/bin/rm-open \1 \5 \2`. iTerm2 reads that setting at launch, so restart it after turning the option on or off.
 

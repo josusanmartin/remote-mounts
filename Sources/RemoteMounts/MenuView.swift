@@ -79,6 +79,19 @@ struct MenuView: View {
         .padding(24)
     }
 
+    private func confirmRelaunchFinder() {
+        let alert = NSAlert()
+        alert.messageText = "Relaunch Finder?"
+        alert.informativeText = "This clears stale copies of your servers that Finder can show after an unmount. "
+            + "Finder reopens its windows, but a copy Finder is in the middle of will stop."
+        alert.addButton(withTitle: "Relaunch Finder")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate()
+        if alert.runModal() == .alertFirstButtonReturn {
+            DispatchQueue.global().async { System.relaunchFinder() }
+        }
+    }
+
     /// Overall progress of downloads in flight; click for the Downloads window.
     private var downloadsRow: some View {
         let active = downloads.active
@@ -118,6 +131,7 @@ struct MenuView: View {
                     m.showManagerWindow?()
                 }
                 Button("Downloads…") { downloads.showWindow?() }
+                Button("Relaunch Finder…") { confirmRelaunchFinder() }
                 Button("Settings…") { m.showSettingsWindow?() }
                 Divider()
                 Button("Quit Remote Mounts") { NSApp.terminate(nil) }

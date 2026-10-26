@@ -73,16 +73,41 @@ enum System {
 
     /// Asks the kernel to unmount while rclone is still serving, so its NFS client gets answers.
     /// Killing rclone first leaves a mount whose server is gone, and unmounting that hangs in the kernel.
-    static func unmountServed(_ mountPoint: String) {
-        guard mountedPaths().contains(mountPoint) else { return }
+    /// Returns the apps that had files open when the unmount had to be forced, nil otherwise.
+    @discardableResult
+    static func unmountServed(_ mountPoint: String) -> [String]? {
+        guard mountedPaths().contains(mountPoint) else { return nil }
         // Through Disk Arbitration first: Finder only hears about unmounts made that way, and
         // keeps a dead "contabo" volume in its sidebar after a plain umount
         run("/usr/sbin/diskutil", ["unmount", mountPoint], timeout: 10)
-        if mountedPaths().contains(mountPoint) { run("/sbin/umount", [mountPoint], timeout: 8) }
-        if mountedPaths().contains(mountPoint) { run("/sbin/umount", ["-f", mountPoint], timeout: 8) }
+        guard mountedPaths().contains(mountPoint) else { return nil }
+        let holders = appsUsing(mountPoint)
+        run("/sbin/umount", [mountPoint], timeout: 8)
+        guard mountedPaths().contains(mountPoint) else { return nil }
+        // Something keeps files open. Forcing it can leave Finder showing stale copies of the volume.
+        run("/sbin/umount", ["-f", mountPoint], timeout: 8)
         if mountedPaths().contains(mountPoint) {
             run("/usr/sbin/diskutil", ["unmount", "force", mountPoint], timeout: 15)
         }
+        return holders
+    }
+
+    /// Names of the apps with files open on the volume mounted at `mountPoint` (lsof on a mount
+    /// point covers the whole volume, without walking it).
+    static func appsUsing(_ mountPoint: String) -> [String] {
+        let (_, out) = run("/usr/sbin/lsof", ["-w", "+c", "0", "-Fc", mountPoint], timeout: 10)
+        var names: [String] = []
+        for line in out.split(separator: "\n") where line.hasPrefix("c") {
+            var name = String(line.dropFirst())
+            if name.hasPrefix("com.apple.Virtualization") { name = "a virtual machine (such as Claude's or Docker's)" }
+            if !names.contains(name) { names.append(name) }
+        }
+        return names
+    }
+
+    /// Quits Finder; macOS starts it again at once, with its windows. Clears stale volumes it shows.
+    static func relaunchFinder() {
+        run("/usr/bin/killall", ["Finder"], timeout: 5)
     }
 
     /// Clears whatever a previous run left at `mountPoint`: a still-running rclone (stopped after
